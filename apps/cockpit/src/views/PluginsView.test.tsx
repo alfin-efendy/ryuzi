@@ -27,8 +27,8 @@ function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}
     installedAt: null,
     updatedAt: null,
     trustTier: null,
-    catalogSource: null,
     catalogVersion: null,
+    componentBacked: false,
     blockedReason: null,
     ...over,
   };
@@ -38,6 +38,11 @@ const github = plugin("github", ["vcs", "issues"]);
 const notion = plugin("notion", ["docs"], { installed: true });
 const anthropic = plugin("anthropic", ["model-provider"], { kind: "provider", family: "anthropic", source: "builtin" });
 const superpowers = plugin("superpowers", ["skills"], { kind: "skill-pack", source: "skill-pack" });
+// First-party component bundles are `PluginSource::Component` rows now, and the
+// "Component plugins" section + bootstrap-retry derive their ids from the list
+// (`componentPluginIds`) rather than a hardcoded constant.
+const mimo = plugin("mimo", ["component"], { source: "component", componentBacked: true });
+const opencode = plugin("opencode", ["component"], { source: "component", componentBacked: true });
 
 const githubApp: AppInfo = {
   id: "github",
@@ -66,7 +71,7 @@ const githubApp: AppInfo = {
 // (apps) and `load` (plugins) effects re-fetch on mount, so tests set these
 // before rendering instead of seeding store state directly.
 let appsFixture: AppInfo[] = [];
-let pluginsFixture: PluginInfo[] = [github, notion];
+let pluginsFixture: PluginInfo[] = [github, notion, mimo, opencode];
 let doctorFindingsFixture: { pluginId: string; severity: string; kind: string; message: string; suggestedAction: string }[] = [];
 let catalogStatusFixture: CatalogStatus = { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 };
 
@@ -312,7 +317,7 @@ function resetPluginsStore() {
 
 beforeEach(() => {
   appsFixture = [];
-  pluginsFixture = [github, notion];
+  pluginsFixture = [github, notion, mimo, opencode];
   doctorFindingsFixture = [];
   catalogStatusFixture = { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 };
   componentBootstrapStatusFixture = { pending: false, message: null };
@@ -389,7 +394,7 @@ test("header shows Add MCP server and Add skill source, not Browse plugins", asy
 });
 
 test("browse lists only not-installed entries", async () => {
-  pluginsFixture = [github, notion];
+  pluginsFixture = [github, notion, mimo, opencode];
   await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Browse" }));
@@ -679,17 +684,20 @@ test("componentPluginStatusLabel reports the active version or Not installed", (
 test("renders the Component plugins section listing every known first-party id, regardless of tab", async () => {
   await renderView();
 
-  expect(await screen.findByText("mimo")).toBeTruthy();
-  expect(screen.getByText("opencode")).toBeTruthy();
+  // The "Manage <id>" button is unique to the Component-plugins section
+  // (`mimo`/`opencode` also now appear as ordinary rows in the grid, so
+  // matching bare text would be ambiguous).
+  expect(await screen.findByRole("button", { name: "Manage mimo" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Manage opencode" })).toBeTruthy();
   expect(screen.getAllByText("Not installed").length).toBe(2);
 
   fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  expect(screen.getByText("mimo")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Manage mimo" })).toBeTruthy();
 });
 
 test("Manage navigates to the component plugin's detail view", async () => {
   await renderView();
-  await screen.findByText("mimo");
+  await screen.findByRole("button", { name: "Manage mimo" });
 
   fireEvent.click(screen.getByRole("button", { name: "Manage mimo" }));
 
@@ -706,7 +714,7 @@ test("shows the retryable bootstrap banner when component_bootstrap_status repor
 
 test("omits the bootstrap banner when nothing is pending", async () => {
   await renderView();
-  await screen.findByText("mimo");
+  await screen.findByRole("button", { name: "Manage mimo" });
 
   expect(screen.queryByText("Component plugins need attention")).toBeNull();
 });

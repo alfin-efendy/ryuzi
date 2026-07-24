@@ -67,7 +67,16 @@ interface RawBlocklistEntry {
  */
 export async function readCatalogEntries(catalogDir: string): Promise<CatalogFeedEntry[]> {
   const glob = new Bun.Glob("*.toml");
-  const files = (await Array.fromAsync(glob.scan(catalogDir))).sort();
+  let files: string[];
+  try {
+    files = (await Array.fromAsync(glob.scan(catalogDir))).sort();
+  } catch (e) {
+    // A missing catalog directory is an empty catalog: the embedded declarative
+    // catalog was removed with the component-catalog migration. (Bun's glob
+    // scan throws ENOENT on some platforms and yields nothing on others.)
+    if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+    throw e;
+  }
   const entries: CatalogFeedEntry[] = [];
   const seenIds = new Map<string, string>();
   for (const file of files) {

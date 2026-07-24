@@ -681,9 +681,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::plugins::Registries;
 
-    /// A control plane wired with every embedded built-in/catalog plugin
-    /// (`install_builtins`), backed by a throwaway on-disk SQLite file (the
-    /// store's pooled connections need a real path, not `:memory:`).
+    /// A control plane wired with every embedded built-in plugin — providers
+    /// plus the first-party component catalog (`install_builtins`) — backed by
+    /// a throwaway on-disk SQLite file (the store's pooled connections need a
+    /// real path, not `:memory:`).
     pub async fn test_cp_with_catalog() -> std::sync::Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
@@ -835,15 +836,17 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn doctor_reports_a_reconnect_required_token() {
-        // Seed an OAuth token flagged reconnect_required for a real catalog
-        // plugin id and assert doctor surfaces the reconnect-required branch.
-        // The token is encrypted at rest, so point the cipher at a hermetic
-        // test key file (never the real keychain) before writing it.
+        // Seed an OAuth token flagged reconnect_required for a REGISTERED
+        // plugin id (doctor only inspects tokens for plugins in the host list)
+        // and assert doctor surfaces the reconnect-required branch. `github`
+        // is a first-party component bundle, registered manifest-only. The
+        // token is encrypted at rest, so point the cipher at a hermetic test
+        // key file (never the real keychain) before writing it.
         crate::llm_router::secrets::use_test_key_file();
         let cp = test_cp_with_catalog().await;
         cp.store()
             .upsert_plugin_oauth_token(&crate::plugins::oauth::PluginOauthToken {
-                plugin_id: "linear".to_string(),
+                plugin_id: "github".to_string(),
                 access_token: "unused-in-this-test".to_string(),
                 refresh_token: None,
                 token_type: "Bearer".to_string(),
@@ -857,7 +860,7 @@ pub(crate) mod tests {
         let findings = plugin_doctor(&cp).await.unwrap();
         let finding = findings
             .iter()
-            .find(|f| f.plugin_id == "linear" && f.kind == "reconnect-required")
+            .find(|f| f.plugin_id == "github" && f.kind == "reconnect-required")
             .expect("doctor should report a reconnect-required finding for the seeded token");
         assert_eq!(finding.severity, "warn");
         assert!(!finding.message.is_empty());

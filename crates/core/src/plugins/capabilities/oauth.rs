@@ -126,10 +126,15 @@ impl<'a> ProfileOauth<'a> {
         }
     }
 
-    /// Resolves the OAuth client id for `profile`: prefer the plugin's own
-    /// setting named by `client_id_setting`, then the cached profile client
-    /// row (filled by discovery/DCR), else `InvalidRequest`.
+    /// Resolves the OAuth client id for `profile`, in priority order: the
+    /// plugin's own setting named by `client_id_setting`, then the cached
+    /// profile client row (a per-install override filled by discovery/DCR),
+    /// then the manifest's baked-in first-party public `client_id` (the `gh`
+    /// CLI model — zero-config connect), else `InvalidRequest`.
     async fn resolve_client_id(&self, profile: &OAuthProfile) -> Result<String, OauthErr> {
+        // Priority: a user-set setting, then a stored per-install override, then
+        // the manifest's baked-in first-party public client id (the `gh` CLI
+        // model). A user/enterprise override always wins over the default.
         if let Some(setting) = &profile.client_id_setting {
             if let Ok(Some(value)) = self.ctx.settings.get(setting).await {
                 if !value.is_empty() {
@@ -144,7 +149,14 @@ impl<'a> ProfileOauth<'a> {
             .await
         {
             if let Some(client_id) = client.client_id {
-                return Ok(client_id);
+                if !client_id.is_empty() {
+                    return Ok(client_id);
+                }
+            }
+        }
+        if let Some(client_id) = &profile.client_id {
+            if !client_id.is_empty() {
+                return Ok(client_id.clone());
             }
         }
         Err(OauthErr::InvalidRequest("missing client id".to_string()))
@@ -205,7 +217,7 @@ impl<'a> ProfileOauth<'a> {
         body: Option<Vec<u8>>,
     ) -> Result<SafeHttpResponse, OauthErr> {
         self.ensure_declared_profile(profile_id)?;
-        let token = self
+        let mut token = self
             .ctx
             .store
             .get_plugin_oauth_profile_token(&self.ctx.plugin_id, profile_id)
@@ -213,8 +225,31 @@ impl<'a> ProfileOauth<'a> {
             .map_err(|error| OauthErr::Failed(error.to_string()))?
             .ok_or(OauthErr::Denied)?;
 
-        if needs_refresh(now_ms(), token.expires_at) {
-            return Err(OauthErr::Expired);
+        // Token validity + refresh. A `None` expiry is a non-expiring token
+        // (e.g. a GitHub OAuth App user token — the device-flow response carries
+        // no `expires_in`), always usable. For a KNOWN expiry:
+        //   - near/past expiry AND a refresh token → refresh it (persisting the
+        //     new token) and use the fresh one; a refresh failure while the
+        //     current token is still valid is tolerated (use the current one),
+        //     but a refresh failure on an already-elapsed token is terminal.
+        //   - past expiry AND no refresh token → unusable (`Expired`).
+        if let Some(exp) = token.expires_at {
+            if needs_refresh(now_ms(), Some(exp)) {
+                if token.refresh_token.is_some() {
+                    match self.refresh_profile_token(profile_id, &token).await {
+                        Ok(refreshed) => token = refreshed,
+                        Err(error) => {
+                            if now_ms() >= exp {
+                                return Err(error);
+                            }
+                            // else: refresh failed but the current token has not
+                            // elapsed yet — proceed with it this time.
+                        }
+                    }
+                } else if now_ms() >= exp {
+                    return Err(OauthErr::Expired);
+                }
+            }
         }
 
         // Bound the request by this profile's timeout (the component's per-call
@@ -229,6 +264,117 @@ impl<'a> ProfileOauth<'a> {
             .request_with_bearer(method, url, headers, body, &token.access_token)
             .await
             .map_err(|error| OauthErr::Failed(format!("{error:?}")))
+    }
+
+    /// Exchanges the stored refresh token for a fresh access token via the OAuth
+    /// 2.0 `refresh_token` grant, persists it, and returns it. The token
+    /// endpoint + client id come from the `(plugin_id, profile_id)`
+    /// `plugin_oauth_profile_clients` row, which the device-flow connect
+    /// persisted — so this needs neither the manifest nor a widened `ctx`.
+    ///
+    /// A definitive provider rejection (a JSON `error`, i.e. the refresh token
+    /// is dead) marks the stored token `reconnect_required` so the UI surfaces
+    /// that a reconnect is needed, and returns [`OauthErr::Expired`]. A
+    /// transient transport error returns [`OauthErr::Failed`] WITHOUT flagging
+    /// reconnect — the caller keeps the still-valid current token.
+    ///
+    /// Refresh needs no `client_secret`: it is only reachable for a profile
+    /// connected via the public device-flow client, which has none.
+    async fn refresh_profile_token(
+        &self,
+        profile_id: &str,
+        current: &crate::plugins::oauth::PluginOauthToken,
+    ) -> Result<crate::plugins::oauth::PluginOauthToken, OauthErr> {
+        let refresh_token = current
+            .refresh_token
+            .as_deref()
+            .ok_or_else(|| OauthErr::InvalidRequest("profile has no refresh token".to_string()))?;
+        let client = self
+            .ctx
+            .store
+            .get_plugin_oauth_profile_client(&self.ctx.plugin_id, profile_id)
+            .await
+            .map_err(|error| OauthErr::Failed(error.to_string()))?
+            .ok_or_else(|| {
+                OauthErr::InvalidRequest("no stored client to refresh against".to_string())
+            })?;
+        let token_url = client
+            .token_url
+            .ok_or_else(|| OauthErr::InvalidRequest("no stored token endpoint".to_string()))?;
+        let client_id = client
+            .client_id
+            .ok_or_else(|| OauthErr::InvalidRequest("no stored client id".to_string()))?;
+
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id.as_str()),
+        ];
+        let response = bounded_http_client()?
+            .post(&token_url)
+            // Same reason as the device-flow endpoints: without this GitHub (and
+            // others) default to a form-urlencoded body the JSON parse rejects.
+            .header("Accept", "application/json")
+            .form(&form)
+            .send()
+            .await
+            .map_err(|error| OauthErr::Failed(describe_reqwest_error(&error)))?;
+        let body = response
+            .text()
+            .await
+            .map_err(|error| OauthErr::Failed(error.to_string()))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| OauthErr::Failed(error.to_string()))?;
+
+        if json.get("error").and_then(|v| v.as_str()).is_some() {
+            // The refresh token is dead (revoked/expired). Flag reconnect so the
+            // UI stops showing "connected", then report expired.
+            let mut dead = current.clone();
+            dead.reconnect_required = true;
+            let _ = self
+                .ctx
+                .store
+                .upsert_plugin_oauth_profile_token(&self.ctx.plugin_id, profile_id, &dead)
+                .await;
+            return Err(OauthErr::Expired);
+        }
+
+        let access_token = json
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OauthErr::Failed("refresh response missing `access_token`".into()))?
+            .to_string();
+        // A provider MAY rotate the refresh token; keep the old one if it didn't.
+        let refreshed_refresh = json
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| current.refresh_token.clone());
+        let token_type = json
+            .get("token_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Bearer")
+            .to_string();
+        let expires_at = json
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .map(|secs| now_ms() + (secs as i64) * 1000);
+
+        let refreshed = crate::plugins::oauth::PluginOauthToken {
+            plugin_id: self.ctx.plugin_id.clone(),
+            access_token,
+            refresh_token: refreshed_refresh,
+            token_type,
+            expires_at,
+            scopes: current.scopes.clone(),
+            reconnect_required: false,
+        };
+        self.ctx
+            .store
+            .upsert_plugin_oauth_profile_token(&self.ctx.plugin_id, profile_id, &refreshed)
+            .await
+            .map_err(|error| OauthErr::Failed(error.to_string()))?;
+        Ok(refreshed)
     }
 
     /// Revokes the local record of `profile_id`'s token — a subsequent
@@ -269,10 +415,14 @@ impl<'a> ProfileOauth<'a> {
 
         let response = bounded_http_client()?
             .post(device_authorization_url)
+            // Without this, GitHub (and other providers) default to a
+            // `application/x-www-form-urlencoded` body, which then fails JSON
+            // parsing with "expected value at line 1 column 1".
+            .header("Accept", "application/json")
             .form(&form)
             .send()
             .await
-            .map_err(|error| OauthErr::Failed(error.to_string()))?;
+            .map_err(|error| OauthErr::Failed(describe_reqwest_error(&error)))?;
         let status = response.status();
         let body = response
             .text()
@@ -364,10 +514,13 @@ impl<'a> ProfileOauth<'a> {
         ];
         let response = bounded_http_client()?
             .post(token_url)
+            // GitHub's token endpoint also defaults to a form-urlencoded body
+            // without this; the poll parses JSON, so ask for JSON explicitly.
+            .header("Accept", "application/json")
             .form(&form)
             .send()
             .await
-            .map_err(|error| OauthErr::Failed(error.to_string()))?;
+            .map_err(|error| OauthErr::Failed(describe_reqwest_error(&error)))?;
         let body = response
             .text()
             .await
@@ -422,12 +575,43 @@ impl<'a> ProfileOauth<'a> {
             .await
             .map_err(|error| OauthErr::Failed(error.to_string()))?;
 
+        // Persist the endpoints refresh will need later. `authorized_request`'s
+        // `refresh_profile_token` reads the `(plugin_id, profile_id)` client row
+        // for the token URL + client id, so it can renew an expiring token
+        // without the manifest in hand. Best-effort: a failure here only means
+        // a future refresh can't run (the token itself is already stored).
+        let _ = self
+            .ctx
+            .store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: self.ctx.plugin_id.clone(),
+                profile_id: profile.id.clone(),
+                authorize_url: profile.authorize_url.clone(),
+                token_url: Some(token_url.to_string()),
+                client_id: Some(client_id.clone()),
+            })
+            .await;
+
         Ok(DevicePollOutcome::Ready)
     }
 }
 
 fn now_ms() -> i64 {
     crate::paths::now_ms()
+}
+
+/// reqwest's `Display` shows only the top-level "error sending request for url
+/// (...)"; the actual cause (connection reset, dns error, timed out, …) lives
+/// in the `source` chain. Flatten the chain so a transport failure is
+/// diagnosable rather than opaque.
+fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut src = std::error::Error::source(error);
+    while let Some(s) = src {
+        parts.push(s.to_string());
+        src = s.source();
+    }
+    parts.join(": ")
 }
 
 /// A plain `reqwest::Client` bounded on BOTH the connect phase and the whole
@@ -483,7 +667,9 @@ mod tests {
             id: id.to_string(),
             authorize_url: Some("https://example.test/authorize".to_string()),
             token_url: Some("https://example.test/token".to_string()),
+            device_authorization_url: None,
             scopes: vec!["repo".to_string(), "issues:read".to_string()],
+            client_id: None,
             client_id_setting: None,
             client_secret_setting: None,
             resource: None,
@@ -576,6 +762,53 @@ mod tests {
             .begin_pkce(&profile, "https://cockpit.local/callback")
             .await;
         assert!(matches!(result, Err(OauthErr::InvalidRequest(_))));
+    }
+
+    // The `gh` CLI model: with no user-set setting and no stored per-install
+    // client, the manifest's baked-in public client id resolves — an end-user
+    // connects with zero configuration.
+    #[tokio::test]
+    async fn resolve_client_id_falls_back_to_the_manifest_baked_client_id() {
+        let (store, _tmp) = open_test_store().await;
+        let ctx = ctx_for(store, "github");
+        let oauth = ProfileOauth::new(&ctx);
+        let mut profile = test_profile("default");
+        profile.client_id = Some("Iv1.baked-public-id".to_string());
+
+        let start = oauth
+            .begin_pkce(&profile, "https://cockpit.local/callback")
+            .await
+            .expect("baked manifest client id should resolve");
+        assert!(start
+            .authorize_url
+            .contains("client_id=Iv1.baked-public-id"));
+    }
+
+    // A stored per-install client id overrides the manifest default.
+    #[tokio::test]
+    async fn stored_client_id_overrides_the_manifest_baked_default() {
+        let (store, _tmp) = open_test_store().await;
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "github".into(),
+                profile_id: "default".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("stored-override".into()),
+            })
+            .await
+            .unwrap();
+        let ctx = ctx_for(store, "github");
+        let oauth = ProfileOauth::new(&ctx);
+        let mut profile = test_profile("default");
+        profile.client_id = Some("Iv1.baked-public-id".to_string());
+
+        let start = oauth
+            .begin_pkce(&profile, "https://cockpit.local/callback")
+            .await
+            .unwrap();
+        assert!(start.authorize_url.contains("client_id=stored-override"));
+        assert!(!start.authorize_url.contains("Iv1.baked-public-id"));
     }
 
     #[tokio::test]
@@ -762,6 +995,186 @@ mod tests {
         assert_eq!(result, Err(OauthErr::Expired));
     }
 
+    // Regression: a NON-EXPIRING token (`expires_at: None` — a GitHub OAuth App
+    // user token, whose device-flow response has no `expires_in`) must be
+    // usable. The old `needs_refresh(None) == true` gate rejected it as
+    // `Expired`, so every tool call reported "GitHub is not connected" even
+    // right after a successful connect.
+    #[tokio::test]
+    async fn authorized_request_with_a_non_expiring_token_is_usable() {
+        async fn ok_body() -> impl IntoResponse {
+            "authorized"
+        }
+        let app = Router::new().route("/me", get(ok_body));
+        let port = spawn_server(app).await;
+
+        let (store, _tmp) = open_test_store().await;
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "default",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "real-host-token".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    // No expiry — the GitHub OAuth App case.
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+        let ctx = ctx_for(store, "github");
+        let oauth = ProfileOauth::new(&ctx);
+
+        let response = oauth
+            .authorized_request(
+                "default",
+                "GET",
+                &format!("http://127.0.0.1:{port}/me"),
+                vec![],
+                None,
+            )
+            .await
+            .expect("a non-expiring token must be usable, not rejected as Expired");
+        assert_eq!(response.body, b"authorized");
+    }
+
+    // An expiring token with a refresh token is renewed on use: the stored
+    // client row (persisted at connect) supplies the token endpoint + client
+    // id, the refresh grant returns a fresh token, and the request goes out
+    // with the NEW bearer. The store ends up holding the refreshed token.
+    #[tokio::test]
+    async fn authorized_request_refreshes_a_near_expiry_token_and_uses_the_new_one() {
+        use axum::routing::post;
+        let app = Router::new()
+            .route(
+                "/token",
+                post(|| async {
+                    r#"{"access_token":"new-access","refresh_token":"rt-new","token_type":"bearer","expires_in":3600}"#
+                }),
+            )
+            .route(
+                "/api",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string()
+                }),
+            );
+        let port = spawn_server(app).await;
+
+        let (store, _tmp) = open_test_store().await;
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "default",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "old-access".into(),
+                    refresh_token: Some("rt-old".into()),
+                    token_type: "Bearer".into(),
+                    expires_at: Some(crate::paths::now_ms() - 1_000), // just elapsed
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "github".into(),
+                profile_id: "default".into(),
+                authorize_url: None,
+                token_url: Some(format!("http://127.0.0.1:{port}/token")),
+                client_id: Some("cid".into()),
+            })
+            .await
+            .unwrap();
+        let ctx = ctx_for(store.clone(), "github");
+        let oauth = ProfileOauth::new(&ctx);
+
+        let response = oauth
+            .authorized_request(
+                "default",
+                "GET",
+                &format!("http://127.0.0.1:{port}/api"),
+                vec![],
+                None,
+            )
+            .await
+            .expect("a near-expiry token with a refresh token must be renewed, not rejected");
+        assert_eq!(response.body, b"Bearer new-access");
+
+        let stored = store
+            .get_plugin_oauth_profile_token("github", "default")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.access_token, "new-access");
+        assert_eq!(stored.refresh_token.as_deref(), Some("rt-new"));
+        assert!(!stored.reconnect_required);
+    }
+
+    // A dead refresh token (the provider answers with an `error`) on an already
+    // elapsed access token is terminal: report `Expired` and flag the stored
+    // token `reconnect_required` so the UI stops showing it connected.
+    #[tokio::test]
+    async fn authorized_request_refresh_failure_on_an_elapsed_token_marks_reconnect() {
+        use axum::routing::post;
+        let app = Router::new().route("/token", post(|| async { r#"{"error":"invalid_grant"}"# }));
+        let port = spawn_server(app).await;
+
+        let (store, _tmp) = open_test_store().await;
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "default",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "old".into(),
+                    refresh_token: Some("rt-dead".into()),
+                    token_type: "Bearer".into(),
+                    expires_at: Some(crate::paths::now_ms() - 1_000),
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "github".into(),
+                profile_id: "default".into(),
+                authorize_url: None,
+                token_url: Some(format!("http://127.0.0.1:{port}/token")),
+                client_id: Some("cid".into()),
+            })
+            .await
+            .unwrap();
+        let ctx = ctx_for(store.clone(), "github");
+        let oauth = ProfileOauth::new(&ctx);
+
+        let result = oauth
+            .authorized_request("default", "GET", "https://example.test/me", vec![], None)
+            .await;
+        assert_eq!(result, Err(OauthErr::Expired));
+
+        let stored = store
+            .get_plugin_oauth_profile_token("github", "default")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.reconnect_required,
+            "a dead refresh token must flag reconnect_required"
+        );
+    }
+
     #[tokio::test]
     async fn authorized_request_honours_the_per_call_timeout_on_a_stalled_upstream() {
         // Regression guard for the OAuth-egress timeout gap the provider
@@ -936,6 +1349,57 @@ mod tests {
         );
     }
 
+    // Regression: GitHub's device endpoints default to a form-urlencoded body,
+    // which fails JSON parsing ("expected value at line 1 column 1") unless we
+    // send `Accept: application/json`. This provider returns form-encoded UNLESS
+    // that header is present, so the flow only parses if we asked for JSON.
+    #[tokio::test]
+    async fn begin_device_flow_asks_for_json_so_a_form_defaulting_provider_parses() {
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+
+        let app = Router::new().route(
+            "/device_authorization",
+            post(|headers: HeaderMap| async move {
+                let wants_json = headers
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("application/json"));
+                let body = if wants_json {
+                    r#"{"device_code":"dc","user_code":"WXYZ-1234","verification_uri":"https://example.test/device","expires_in":900,"interval":5}"#
+                } else {
+                    "device_code=dc&user_code=WXYZ-1234&verification_uri=https%3A%2F%2Fexample.test%2Fdevice&expires_in=900&interval=5"
+                };
+                (axum::http::StatusCode::OK, body)
+            }),
+        );
+        let port = spawn_server(app).await;
+
+        let (store, _tmp) = open_test_store().await;
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "github".into(),
+                profile_id: "default".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("client-abc".into()),
+            })
+            .await
+            .unwrap();
+        let ctx = ctx_for(store, "github");
+        let oauth = ProfileOauth::new(&ctx);
+
+        let start = oauth
+            .begin_device_flow(
+                &test_profile("default"),
+                &format!("http://127.0.0.1:{port}/device_authorization"),
+            )
+            .await
+            .expect("Accept: application/json must be sent so the JSON body parses");
+        assert_eq!(start.user_code, "WXYZ-1234");
+        assert_eq!(start.device_code, "dc");
+    }
+
     #[tokio::test]
     async fn begin_device_flow_defaults_interval_to_five_when_omitted() {
         use axum::routing::post;
@@ -1050,6 +1514,16 @@ mod tests {
             .expect("token should be persisted on Ready");
         assert_eq!(stored.access_token, "at");
         assert_eq!(stored.refresh_token, Some("rt".to_string()));
+
+        // Ready also persists the token endpoint + client id into the client
+        // row, so a later `authorized_request` can refresh without the manifest.
+        let client = store
+            .get_plugin_oauth_profile_client("github", "default")
+            .await
+            .unwrap()
+            .expect("connect should persist the client row for refresh");
+        assert_eq!(client.token_url.as_deref(), Some(token_url.as_str()));
+        assert_eq!(client.client_id.as_deref(), Some("client-abc"));
     }
 
     #[tokio::test]

@@ -925,9 +925,12 @@ pub struct PluginInfo {
     pub installed_at: Option<i64>,
     pub updated_at: Option<i64>,
     pub trust_tier: Option<String>,
-    /// `embedded` | `remote` — which catalog source won for this id.
-    /// `None` for builtins and skill packs (never from either catalog).
-    pub catalog_source: Option<String>,
+    /// This id ships as a first-party WASM component bundle
+    /// (`plugins::component_catalog::is_component_bundle`). True regardless of
+    /// which registration won the id — a provider bundle is represented by its
+    /// builtin row but is still component-backed — so Cockpit can offer
+    /// release management (install / active version / rollback) for it.
+    pub component_backed: bool,
     /// The remote catalog feed's `version` for this id, when a cached
     /// `plugin_catalog_cache` row matches. `None` when the id was never seen
     /// in a fetched feed.
@@ -1245,6 +1248,22 @@ impl From<crate::store::ComponentPluginReleaseRecord> for ComponentReleaseInfo {
 pub struct ComponentOauthProfileInfo {
     pub id: String,
     pub scopes: Vec<String>,
+    /// The profile's token endpoint (`token_url`), which the device-flow poll
+    /// exchanges the device code against. `None` when the manifest omits it.
+    pub token_url: Option<String>,
+    /// The RFC 8628 device-authorization endpoint. Present iff this profile
+    /// supports the device grant — Cockpit's Connect button only shows when it
+    /// is set.
+    pub device_authorization_url: Option<String>,
+    /// A token row exists for `(plugin_id, profile_id)` — i.e. the profile is
+    /// connected. Enriched from the store in `plugin_release_detail`; the pure
+    /// manifest [`From`] conversion leaves it `false`.
+    pub connected: bool,
+    /// A client id resolves for this profile (manifest baked-in, a stored
+    /// per-install override, or a settings value) — Connect is gated on this.
+    /// The pure [`From`] sets it from the manifest's baked `client-id` only;
+    /// `plugin_release_detail` ORs in a stored override.
+    pub client_id_configured: bool,
 }
 
 /// Task 12 cross-layer addition: the currently ACTIVE version's bundle
@@ -1299,6 +1318,10 @@ impl From<ryuzi_plugin_sdk::PluginBundleManifest> for ComponentManifestInfo {
                 .map(|p| ComponentOauthProfileInfo {
                     id: p.id,
                     scopes: p.scopes,
+                    token_url: p.token_url,
+                    device_authorization_url: p.device_authorization_url,
+                    connected: false,
+                    client_id_configured: p.client_id.is_some(),
                 })
                 .collect(),
         }

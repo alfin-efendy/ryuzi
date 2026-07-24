@@ -689,7 +689,7 @@ env = { GITHUB_TOKEN = "${auth}" }
             .unwrap();
 
         let manifest = PluginManifest::from_toml(GITHUB_STDIO_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin
             .connector
             .clone()
@@ -721,7 +721,7 @@ env = { GITHUB_TOKEN = "${auth}" }
     async fn ensure_auth_errs_with_help_url_when_secret_is_missing_everywhere() {
         let (_store, settings, _tmp) = open_settings().await;
         let manifest = PluginManifest::from_toml(GITHUB_STDIO_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
@@ -744,7 +744,7 @@ env = { GITHUB_TOKEN = "${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(GITHUB_STDIO_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         connector.ensure_auth(&ctx(settings)).await.unwrap();
@@ -817,7 +817,7 @@ env = { GOOGLE_OAUTH_CLIENT_ID = "${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(ACME_REQUIRED_SETTING_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
@@ -848,7 +848,7 @@ env = { GOOGLE_OAUTH_CLIENT_ID = "${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(ACME_REQUIRED_SETTING_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         connector.ensure_auth(&ctx(settings)).await.unwrap();
@@ -876,7 +876,7 @@ env = {{ TOKEN = "${{env:{var}}}" }}
 "#
         );
         let manifest = PluginManifest::from_toml(&toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -910,7 +910,7 @@ command = "acme-mcp"
 args = ["--host", "${setting:plugin.acme.host}"]
 "#;
         let manifest = PluginManifest::from_toml(toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -949,7 +949,7 @@ url = "https://api.acme.dev/mcp"
 headers = { Authorization = "Bearer ${auth}" }
 "#;
         let manifest = PluginManifest::from_toml(toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -984,7 +984,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .unwrap();
 
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -1055,7 +1055,7 @@ headers = { Authorization = "Bearer ${auth}" }
             &format!("help_url = \"https://acme.example.com/oauth\"\ntoken-url = \"{token_url}\""),
         );
         let manifest = PluginManifest::from_toml(&toml).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -1141,7 +1141,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .unwrap();
 
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -1174,7 +1174,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.mcp_servers(&ctx(settings)).await.unwrap_err();
@@ -1232,7 +1232,7 @@ headers = { Authorization = "Bearer ${auth}" }
             &format!("help_url = \"https://acme.example.com/oauth\"\ntoken-url = \"{token_url}\""),
         );
         let manifest = PluginManifest::from_toml(&toml).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
@@ -1253,7 +1253,7 @@ headers = { Authorization = "Bearer ${auth}" }
     async fn http_oauth_manifest_requires_stored_plugin_token_for_ensure_auth_and_mcp_servers() {
         let (_store, settings, _tmp) = open_settings().await;
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector
@@ -1295,7 +1295,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
@@ -1319,7 +1319,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .unwrap();
 
         let manifest = PluginManifest::from_toml(GOOGLE_STYLE_STDIO_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         connector.ensure_auth(&ctx(settings.clone())).await.unwrap();
@@ -1346,7 +1346,7 @@ id = "meta-only"
 name = "Meta Only"
 "#;
         let manifest = PluginManifest::from_toml(toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         assert!(plugin.connector.is_none());
         assert!(plugin.harness.is_none());
         assert!(plugin.gateway.is_none());
@@ -1390,7 +1390,7 @@ timeout_ms = 9000
             .unwrap();
 
         let manifest = PluginManifest::from_toml(LINTER_EXTENSION_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let factory = plugin
             .extension
             .clone()
@@ -1437,7 +1437,7 @@ name = "bare"
 command = "bare-ext"
 "#;
         let manifest = PluginManifest::from_toml(toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
         let factory = plugin.extension.clone().unwrap();
 
         let specs = factory.extensions(&ext_ctx(settings)).await.unwrap();
@@ -1473,6 +1473,6 @@ command = "bare-ext"
             skills: vec![],
             provider: None,
         };
-        assert!(declarative_plugin(manifest, PluginSource::Catalog).is_err());
+        assert!(declarative_plugin(manifest, PluginSource::Component).is_err());
     }
 }

@@ -7,19 +7,24 @@ import {
   type ComponentReleaseDetail,
   type DoctorFinding,
   type PluginInfo,
+  type PluginProfileDeviceFlowStart,
 } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
-// embedded catalog, or user-authored — and this store mirrors the flattened
+// component bundle, or user-authored — and this store mirrors the flattened
 // `PluginInfo` list Cockpit needs for the Plugins hub screens.
 
-// The Task 11a first-party component (WASM bundle) ids, mirroring
-// `crate::plugins::remote_catalog::FIRST_PARTY_BUNDLE_IDS`. Component bundles
-// are NOT registered as `CorePlugin`s (see `plugins::host`'s doc), so they
-// never appear in `listPlugins`/`pluginDetail` — this is Cockpit's only way
-// to know which ids to ask `pluginReleaseDetail` about for the Installed
-// tab's "Component plugins" section and the bootstrap-retry banner.
-export const FIRST_PARTY_BUNDLE_IDS = ["mimo", "opencode"] as const;
+/** Ids of every component-sourced plugin in the engine's list.
+ *
+ *  Replaces the old hardcoded `FIRST_PARTY_BUNDLE_IDS`. Component bundles are
+ *  now registered as manifest-only `CorePlugin`s
+ *  (`plugins::component_catalog`, `PluginSource::Component`), so they DO appear
+ *  in `listPlugins` and the engine is the single source of truth for which
+ *  components exist — Cockpit no longer has to mirror a Rust constant to know
+ *  which ids to ask `pluginReleaseDetail` about. */
+export function componentPluginIds(plugins: Pick<PluginInfo, "id" | "source">[]): string[] {
+  return plugins.filter((p) => p.source === "component").map((p) => p.id);
+}
 
 type PluginsState = {
   plugins: PluginInfo[];
@@ -37,10 +42,10 @@ type PluginsState = {
   /** `component_bootstrap_status` snapshot for the Plugins view's retryable
    *  bootstrap banner — `null` until the first fetch resolves. */
   componentBootstrapStatus: ComponentBootstrapStatus | null;
-  /** `plugin_release_detail` for every known first-party component id
-   *  (`FIRST_PARTY_BUNDLE_IDS`) — the Installed tab's "Component plugins"
-   *  section reads this instead of `plugins` (component bundles aren't
-   *  `PluginInfo` entries). */
+  /** `plugin_release_detail` for every component-sourced id in `plugins`
+   *  (see `componentPluginIds`) — the Installed tab's "Component plugins"
+   *  section reads this for the release ledger (version, rollback), which a
+   *  `PluginInfo` row does not carry. */
   componentPlugins: ComponentReleaseDetail[];
   componentPluginsLoaded: boolean;
   load: () => Promise<void>;
@@ -55,6 +60,22 @@ type PluginsState = {
   pluginReleaseDetail: (id: string) => Promise<ComponentReleaseDetail | null>;
   installComponentPlugin: (id: string, version?: string) => Promise<ComponentReleaseDetail | null>;
   rollbackComponentPlugin: (id: string, fromVersion: string, toVersion: string) => Promise<ComponentReleaseDetail | null>;
+  /** Component OAuth profile device-flow connect. Thin RPC wrappers — the
+   *  poll loop + code display live in the view (`PluginDetailView`), which owns
+   *  the transient flow state. All toast on error. */
+  beginProfileDeviceFlow: (
+    pluginId: string,
+    profileId: string,
+    deviceAuthorizationUrl: string,
+  ) => Promise<PluginProfileDeviceFlowStart | null>;
+  pollProfileDeviceFlow: (
+    pluginId: string,
+    profileId: string,
+    tokenUrl: string,
+    deviceCode: string,
+    expiresAt: number,
+  ) => Promise<string | null>;
+  disconnectProfile: (pluginId: string, profileId: string) => Promise<boolean>;
   /** Manually retries the first-party bootstrap (which otherwise only runs
    *  automatically at daemon start): attempts `installComponentPlugin` for
    *  every known first-party id, then reloads the bootstrap status and the
@@ -202,7 +223,8 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   },
 
   loadComponentPlugins: async () => {
-    const details = await Promise.all(FIRST_PARTY_BUNDLE_IDS.map((id) => commands.pluginReleaseDetail("local", id)));
+    const ids = componentPluginIds(get().plugins);
+    const details = await Promise.all(ids.map((id) => commands.pluginReleaseDetail("local", id)));
     const componentPlugins = details.flatMap((res) => (res.status === "ok" ? [res.data] : []));
     set({ componentPlugins, componentPluginsLoaded: true });
   },
@@ -238,8 +260,37 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     return res.data;
   },
 
+  beginProfileDeviceFlow: async (pluginId, profileId, deviceAuthorizationUrl) => {
+    const res = await commands.pluginProfileBeginDeviceFlow("local", pluginId, profileId, deviceAuthorizationUrl);
+    if (res.status === "error") {
+      toast.error(`Couldn't start the connection: ${res.error.message}`);
+      return null;
+    }
+    return res.data;
+  },
+
+  pollProfileDeviceFlow: async (pluginId, profileId, tokenUrl, deviceCode, expiresAt) => {
+    const res = await commands.pluginProfilePollDeviceFlow("local", pluginId, profileId, tokenUrl, deviceCode, expiresAt);
+    // A poll RPC error is usually a transient network blip on the fresh
+    // connection this poll opens — the caller's loop tolerates a few of these
+    // and keeps polling, so DON'T toast here (that would spam every retry).
+    if (res.status === "error") return null;
+    return res.data;
+  },
+
+  disconnectProfile: async (pluginId, profileId) => {
+    const res = await commands.pluginProfileDisconnect("local", pluginId, profileId);
+    if (res.status === "error") {
+      toast.error(`Disconnect failed: ${res.error.message}`);
+      return false;
+    }
+    toast.success("Disconnected");
+    return true;
+  },
+
   retryComponentBootstrap: async () => {
-    await Promise.allSettled(FIRST_PARTY_BUNDLE_IDS.map((id) => commands.installComponentPlugin("local", id, null)));
+    const ids = componentPluginIds(get().plugins);
+    await Promise.allSettled(ids.map((id) => commands.installComponentPlugin("local", id, null)));
     await get().loadComponentPlugins();
     const res = await commands.componentBootstrapStatus("local");
     if (res.status !== "ok") return;

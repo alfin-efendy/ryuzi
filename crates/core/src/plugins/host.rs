@@ -138,16 +138,17 @@ fn register_plugin_fields(manifest: &PluginManifest) {
 pub enum PluginSource {
     /// Shipped inside the `ryuzi` binary (the native harness, the discord gateway).
     Builtin,
-    /// Bundled in the embedded plugin catalog.
-    Catalog,
-    /// Delivered by the signed remote catalog feed (see
-    /// `crate::plugins::remote_catalog`). Distinct from `Catalog` only so the
-    /// api layer can report `catalogSource: "remote"`.
-    RemoteCatalog,
     /// Installed as a skill pack by the skills installer
     /// (`crate::skills_install`) — carries the manifest's own on-disk
     /// directory.
     SkillPack(std::path::PathBuf),
+    /// A signed WASM component bundle shipped first-party from `plugins/<id>`
+    /// (see `crate::plugins::component_catalog`). Registered manifest-only:
+    /// the executable capability is still discovered off disk in
+    /// `daemon::build_daemon` from the *installed* bundle root, so this entry
+    /// exists purely to make the bundle visible and enumerable through
+    /// `list_plugins`.
+    Component,
 }
 
 /// A manifest bound to the behavioral capabilities it advertises. Each
@@ -312,6 +313,8 @@ impl PluginHost {
     /// - harness-capable → always `true` (the native runtime cannot be
     ///   disabled)
     /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
+    /// - component bundle → the setting `plugin.<id>.enabled == "true"`
+    ///   (defaults to `false`), matching `component_plugin_enabled`
     /// - experimental → always `false` (see below)
     /// - manifest-only (no harness/gateway/connector/extension capability)
     ///   → always `true`
@@ -324,6 +327,17 @@ impl PluginHost {
         if plugin.harness.is_some() {
             // The native runtime is the only harness and is always enabled.
             return Ok(true);
+        }
+        if plugin.source == PluginSource::Component {
+            // A first-party WASM component bundle is registered manifest-only
+            // (its connector/gateway/provider capability runs off-disk), but
+            // ALL of those gate on `plugin.<id>.enabled` via
+            // `component_plugin_enabled`. Report that same gate so the UI
+            // reflects the real switch instead of the manifest-only
+            // "always on" default below — and so `toggle_enabled` has a switch
+            // to flip.
+            let key = format!("plugin.{id}.enabled");
+            return Ok(settings.get(&key).await?.as_deref() == Some("true"));
         }
         if plugin.gateway.is_some() {
             let enabled = csv(settings.get("enabled_gateways").await?.as_deref());

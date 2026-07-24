@@ -228,16 +228,20 @@ export function PluginsView() {
     if (!pluginsLoaded) void loadPlugins();
   }, [pluginsLoaded, loadPlugins]);
 
-  // Component (WASM bundle) plugins — e.g. mimo/opencode — are never
-  // `CorePlugin`s, so they never appear in `listPlugins`; this is Cockpit's
-  // only fetch for their release ledger + bootstrap status.
+  // Component (WASM bundle) plugins — e.g. mimo/opencode — DO appear in
+  // `listPlugins` now (`PluginSource::Component`); this fetch adds their
+  // release ledger + bootstrap status, which a `PluginInfo` row does not carry.
   useEffect(() => {
     void loadComponentBootstrapStatus();
   }, [loadComponentBootstrapStatus]);
 
+  // Must wait for the plugin list: `loadComponentPlugins` derives which ids to
+  // fetch release detail for from the component-sourced rows in `plugins`
+  // (`componentPluginIds`). Firing before `loadPlugins` resolves would derive
+  // from an empty list and leave the Component-plugins section empty.
   useEffect(() => {
-    if (!componentPluginsLoaded) void loadComponentPlugins();
-  }, [componentPluginsLoaded, loadComponentPlugins]);
+    if (pluginsLoaded && !componentPluginsLoaded) void loadComponentPlugins();
+  }, [pluginsLoaded, componentPluginsLoaded, loadComponentPlugins]);
 
   useEffect(() => {
     if (!doctorLoaded) void loadDoctor();
@@ -384,13 +388,12 @@ export function PluginsView() {
           </Card>
         )}
 
-        {/* Component (WASM bundle) plugins — e.g. mimo/opencode — are never
-            `CorePlugin`s (see `store-plugins.ts`'s `FIRST_PARTY_BUNDLE_IDS`
-            doc), so they never appear in the Installed/Browse grids below,
-            which are both sourced from `listPlugins`. This card is their only
-            entry point regardless of which tab is selected, and doubles as
-            the "not installed yet" affordance (its detail view owns the
-            permission-confirmation install flow). */}
+        {/* Component (WASM bundle) plugins now ARE `CorePlugin`s
+            (`PluginSource::Component`, see `plugins::component_catalog`), so
+            they appear in the Installed/Browse grids below like any other
+            plugin. This card stays as their RELEASE-management surface —
+            active version, install, rollback — which a `PluginInfo` row does
+            not carry, and it renders regardless of which tab is selected. */}
         {componentPluginsLoaded && componentPlugins.length > 0 && (
           <Card className="mb-4 px-[18px] py-4">
             <div className="mb-3 text-sm font-semibold">Component plugins</div>

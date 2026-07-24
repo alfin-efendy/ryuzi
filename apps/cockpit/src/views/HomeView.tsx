@@ -445,7 +445,7 @@ export function HomeView() {
                 }
               />
             )}
-            {registry && registry.agents.some((a) => a.executable) && (
+            {registry?.agents.some((a) => a.executable) && (
               <Combobox
                 aria-label="Agent"
                 options={registry.agents.filter((a) => a.executable).map((a) => ({ value: a.id, label: a.name }))}

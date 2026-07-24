@@ -54,21 +54,15 @@ fn set_invalid_value_returns_nonzero_with_exact_message() {
 }
 
 #[test]
-fn get_redacts_secrets_unless_revealed() {
+fn get_returns_empty_for_unset_and_unknown_keys() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("t.sqlite");
-    // `plugin.github.token` is a registered secret plugin field (the github
-    // catalog manifest's `auth.setting`) — see
-    // `plugin_setting_is_recognized_validated_and_redacted` below.
-    run(
-        &db,
-        &["config", "set", "plugin.github.token", "supersecret"],
-    );
-    let (_, out, _) = run(&db, &["config", "get", "plugin.github.token"]);
-    assert_eq!(out.last().map(String::as_str), Some("••••••••"));
-    let (_, out, _) = run(&db, &["config", "get", "--reveal", "plugin.github.token"]); // flag before key
-    assert_eq!(out.last().map(String::as_str), Some("supersecret"));
-    // unknown/unset key prints empty and exits 0:
+    // An unset (but recognized) key prints empty and exits 0.
+    let (code, out, _) = run(&db, &["config", "get", "plugin.github.enabled"]);
+    assert_eq!(code, 0);
+    assert_eq!(out.last().map(String::as_str), Some(""));
+    // An unknown key also prints empty and exits 0 — `get` never errors on a
+    // missing key (only `set` validates).
     let (code, out, _) = run(&db, &["config", "get", "totally_unknown"]);
     assert_eq!(code, 0);
     assert_eq!(out.last().map(String::as_str), Some(""));
@@ -93,37 +87,34 @@ fn list_shows_redaction_defaults_and_unset() {
 }
 
 /// Regression test: `cmd_config` used to run settings get/set/list without
-/// ever populating the process-wide `plugin.*` fields registry (that table
-/// is normally populated as a side effect of `Registries::add_plugin`, which
+/// ever populating the process-wide `plugin.*` fields registry (that table is
+/// normally populated as a side effect of `Registries::add_plugin`, which
 /// `ryuzi config` never calls — it opens the settings store directly instead
-/// of building a full `Registries`).
-/// So `config set plugin.<id>.<key> ...` failed "unknown setting" for every
-/// real plugin field, and `config get` would report a registered secret as
-/// non-secret (empty table → `is_secret` false) and print it unredacted.
+/// of building a full `Registries`). So `config set plugin.<id>.<key> ...`
+/// failed "unknown setting" for every real plugin field.
+///
+/// The embedded catalog (the only source of secret plugin `auth.setting`
+/// fields) has been removed, so this guards recognition via
+/// `plugin.<id>.enabled` — registered for every builtin plugin, including the
+/// first-party `github` WASM component.
 #[test]
-fn plugin_setting_is_recognized_validated_and_redacted() {
+fn plugin_field_is_recognized_and_unknown_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("t.sqlite");
 
-    // `plugin.github.token` comes from the `github` catalog manifest's
-    // `[auth]` block (`auth.setting`), registered as a synthetic secret
-    // `String` field by `register_plugin_fields`.
-    let (code, out, _) = run(&db, &["config", "set", "plugin.github.token", "tok"]);
+    let (code, out, _) = run(&db, &["config", "set", "plugin.github.enabled", "true"]);
     assert_eq!(code, 0);
     assert_eq!(
         out.last().map(String::as_str),
-        Some("set plugin.github.token")
+        Some("set plugin.github.enabled")
     );
 
-    let (code, out, _) = run(&db, &["config", "get", "plugin.github.token"]);
+    // Round-trips through `get` (a Bool, not a secret, so shown as-is).
+    let (code, out, _) = run(&db, &["config", "get", "plugin.github.enabled"]);
     assert_eq!(code, 0);
-    assert_eq!(out.last().map(String::as_str), Some("••••••••"));
+    assert_eq!(out.last().map(String::as_str), Some("true"));
 
-    let (_, out, _) = run(&db, &["config", "get", "--reveal", "plugin.github.token"]);
-    assert_eq!(out.last().map(String::as_str), Some("tok"));
-
-    // An unrecognized `plugin.*` key must still error "unknown setting",
-    // same as before this fix.
+    // An unrecognized `plugin.*` key must still error "unknown setting".
     let (code, _, errs) = run(&db, &["config", "set", "plugin.nope-unknown.token", "x"]);
     assert_eq!(code, 1);
     assert_eq!(

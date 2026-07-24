@@ -1497,6 +1497,30 @@ async disconnectPluginOauth(runnerId: string | null, pluginId: string) : Promise
     else return { status: "error", error: e  as any };
 }
 },
+async pluginProfileBeginDeviceFlow(runnerId: string | null, pluginId: string, profileId: string, deviceAuthorizationUrl: string) : Promise<Result<PluginProfileDeviceFlowStart, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_profile_begin_device_flow", { runnerId, pluginId, profileId, deviceAuthorizationUrl }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async pluginProfilePollDeviceFlow(runnerId: string | null, pluginId: string, profileId: string, tokenUrl: string, deviceCode: string, expiresAt: number) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_profile_poll_device_flow", { runnerId, pluginId, profileId, tokenUrl, deviceCode, expiresAt }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async pluginProfileDisconnect(runnerId: string | null, pluginId: string, profileId: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_profile_disconnect", { runnerId, pluginId, profileId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async pluginModels(runnerId: string | null, id: string) : Promise<Result<string[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("plugin_models", { runnerId, id }) };
@@ -2129,7 +2153,31 @@ domains: string[]; oauthProfiles: ComponentOauthProfileInfo[] }
  * never a live credential; the full connect flow is Task 13). Mirror of
  * `ryuzi_plugin_sdk::OAuthProfile` trimmed to what Cockpit displays.
  */
-export type ComponentOauthProfileInfo = { id: string; scopes: string[] }
+export type ComponentOauthProfileInfo = { id: string; scopes: string[];
+/**
+ * The profile's token endpoint (`token_url`), which the device-flow poll
+ * exchanges the device code against. `None` when the manifest omits it.
+ */
+tokenUrl: string | null;
+/**
+ * The RFC 8628 device-authorization endpoint. Present iff this profile
+ * supports the device grant — Cockpit's Connect button only shows when it
+ * is set.
+ */
+deviceAuthorizationUrl: string | null;
+/**
+ * A token row exists for `(plugin_id, profile_id)` — i.e. the profile is
+ * connected. Enriched from the store in `plugin_release_detail`; the pure
+ * manifest [`From`] conversion leaves it `false`.
+ */
+connected: boolean;
+/**
+ * A client id resolves for this profile (manifest baked-in, a stored
+ * per-install override, or a settings value) — Connect is gated on this.
+ * The pure [`From`] sets it from the manifest's baked `client-id` only;
+ * `plugin_release_detail` ORs in a stored override.
+ */
+clientIdConfigured: boolean }
 /**
  * `plugin_release_detail` RPC result: every recorded release for a component
  * plugin (oldest first, as the store returns them) plus the currently active
@@ -2532,10 +2580,13 @@ pinned: boolean;
  */
 sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null;
 /**
- * `embedded` | `remote` — which catalog source won for this id.
- * `None` for builtins and skill packs (never from either catalog).
+ * This id ships as a first-party WASM component bundle
+ * (`plugins::component_catalog::is_component_bundle`). True regardless of
+ * which registration won the id — a provider bundle is represented by its
+ * builtin row but is still component-backed — so Cockpit can offer
+ * release management (install / active version / rollback) for it.
  */
-catalogSource: string | null;
+componentBacked: boolean;
 /**
  * The remote catalog feed's `version` for this id, when a cached
  * `plugin_catalog_cache` row matches. `None` when the id was never seen
@@ -2601,6 +2652,12 @@ export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string;
  * failure — the flow entry survives failures so manual paste still works.
  */
 export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
+/**
+ * `plugin_profile_begin_device_flow` RPC result. Mirror of
+ * `crate::plugins::capabilities::oauth::DeviceFlowStart`. `user_code` is shown
+ * to the user once and must never be written to durable telemetry.
+ */
+export type PluginProfileDeviceFlowStart = { deviceCode: string; userCode: string; verificationUri: string; verificationUriComplete: string | null; intervalSecs: number; expiresAt: number }
 /**
  * Identifies the plugin an approvable action originates from — attribution
  * only, so an operator can see "this MCP tool belongs to plugin X" instead

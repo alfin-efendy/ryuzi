@@ -32,8 +32,8 @@ const githubDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
-    catalogSource: null,
     catalogVersion: null,
+    componentBacked: false,
     blockedReason: null,
   },
   auth: {
@@ -78,8 +78,8 @@ const ollamaDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
-    catalogSource: null,
     catalogVersion: null,
+    componentBacked: false,
     blockedReason: null,
   },
   auth: null,
@@ -126,8 +126,8 @@ const sandboxDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
-    catalogSource: null,
     catalogVersion: null,
+    componentBacked: false,
     blockedReason: null,
   },
   auth: null,
@@ -165,8 +165,8 @@ const extensionDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
-    catalogSource: null,
     catalogVersion: null,
+    componentBacked: false,
     blockedReason: null,
   },
   auth: null,
@@ -208,8 +208,8 @@ const skillPackDetail: PluginDetail = {
     installedAt: SKILL_PACK_INSTALLED_AT,
     updatedAt: SKILL_PACK_UPDATED_AT,
     trustTier: "acknowledged",
-    catalogSource: null,
     catalogVersion: null,
+    componentBacked: false,
     blockedReason: null,
   },
   auth: null,
@@ -244,8 +244,8 @@ const oauthDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
-    catalogSource: null,
     catalogVersion: null,
+    componentBacked: false,
     blockedReason: null,
   },
   auth: {
@@ -294,8 +294,8 @@ const richFieldsDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
-    catalogSource: null,
     catalogVersion: null,
+    componentBacked: false,
     blockedReason: null,
   },
   auth: null,
@@ -349,6 +349,37 @@ const err = (message: string) => Promise.resolve({ status: "error" as const, err
 // it, it doesn't just paint a session-only flag).
 let acmePackPinned = false;
 
+// A first-party component (WASM bundle) plugin's `plugin_detail`: registered
+// manifest-only now (`PluginSource::Component`, `componentBacked: true`), so it
+// resolves a real detail rather than 404ing. Its release-management UI (install
+// / rollback / permission gate) comes from the `ComponentReleaseCard`, which
+// the view renders for any `componentBacked` plugin.
+function componentDetail(id: string): PluginDetail {
+  return {
+    info: {
+      ...githubDetail.info,
+      id,
+      name: id,
+      description: "First-party WASM component.",
+      icon: null,
+      categories: ["component"],
+      source: "component",
+      capabilities: [],
+      kind: "component",
+      componentBacked: true,
+    },
+    auth: null,
+    settings: [],
+    mcp: [],
+    models: [],
+    homepage: null,
+    // Left blank so a release fixture's own manifest publisher (asserted via a
+    // bare `getByText`) stays unambiguous — the header subtitle falls back to
+    // the (distinct) description above, not the plugin id.
+    publisher: "",
+  };
+}
+
 const pluginDetail = mock((_runnerId: string, id: string) => {
   if (id === "github") return ok(githubDetail);
   if (id === "ollama") return ok(ollamaDetail);
@@ -357,16 +388,12 @@ const pluginDetail = mock((_runnerId: string, id: string) => {
   if (id === "vercel-sandbox") return ok(sandboxDetail);
   if (id === "acme-ext") return ok(extensionDetail);
   if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
-  // Component (WASM bundle) plugins — e.g. mimo/opencode — are never
-  // `CorePlugin`s, so `plugin_detail` 404s for them with this EXACT message
-  // shape (`anyhow::bail!("unknown plugin: {id}")` in `assemble_detail`).
-  // The view must suppress the toast for precisely this shape (component-only
-  // render below) while still toasting the generic "unknown plugin" fallback
-  // (no id) used by the ghost-id test.
-  // Task 15c: `atlassian`/`bitbucket` are first-party connector components
-  // installed on demand via `install_component_release` (like `github`), NOT
-  // `CorePlugin`s — same 404 shape as mimo/opencode.
-  if (id === "mimo" || id === "opencode" || id === "atlassian" || id === "bitbucket") return err(`unknown plugin: ${id}`);
+  // First-party component (WASM bundle) plugins are registered manifest-only
+  // now, so `plugin_detail` resolves them. The release ledger + install gate
+  // still come from `pluginReleaseDetail`/`ComponentReleaseCard`.
+  if (id === "mimo" || id === "opencode" || id === "atlassian" || id === "bitbucket") return ok(componentDetail(id));
+  // A genuinely unknown id still 404s with the generic (no-id) shape the
+  // ghost-id test asserts on.
   return err("unknown plugin");
 });
 const setPluginEnabled = mock((_runnerId: string, _id: string, _enabled: boolean) => ok(null));
@@ -904,16 +931,17 @@ test("extension_status entries for a different plugin are filtered out", async (
 
 // ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
 //
-// mimo/opencode are never `CorePlugin`s, so `pluginDetail("mimo")` 404s
-// (`unknown plugin: mimo` — see the `pluginDetail` mock above) and the view
-// falls back to the component-only render driven entirely by
-// `pluginReleaseDetail`.
+// mimo/opencode are registered manifest-only `CorePlugin`s now, so
+// `pluginDetail("mimo")` resolves a real detail (see `componentDetail`) and the
+// view renders the normal detail page PLUS the `ComponentReleaseCard` (release
+// ledger + install/permission gate) driven by `pluginReleaseDetail`.
 
-test("a never-installed component plugin opens its management page (not 'Plugin not found') and never toasts the expected 404", async () => {
+test("a never-installed component plugin opens its management page (not 'Plugin not found')", async () => {
   render(<PluginDetailView id="mimo" />);
 
   expect(await screen.findByText("mimo")).toBeTruthy();
-  expect(screen.getByText("Component plugin (WASM bundle)")).toBeTruthy();
+  // The install gate is reachable even before any release exists.
+  expect(screen.getByRole("button", { name: "Install" })).toBeTruthy();
   expect(screen.getByText("Not installed")).toBeTruthy();
   expect(screen.queryByText("Plugin not found.")).toBeNull();
 });

@@ -62,6 +62,16 @@ fn github_manifest_path() -> PathBuf {
     repo_path("plugins/github/ryuzi-plugin.toml")
 }
 
+/// The github component's own manifest version — the single source of truth, so
+/// these fixtures never mismatch it after a version bump. `install_verified`
+/// requires the release descriptor's version to equal the manifest's.
+fn github_manifest_version() -> String {
+    let toml = std::fs::read_to_string(github_manifest_path()).unwrap();
+    ryuzi_plugin_sdk::PluginBundleManifest::from_toml(&toml)
+        .unwrap()
+        .version
+}
+
 fn github_wasm_path() -> PathBuf {
     repo_path("plugins/github/target/wasm32-wasip2/release/ryuzi_plugin_github.wasm")
 }
@@ -131,7 +141,7 @@ fn build_github_artifacts_with_wasm(
     let component_url = format!("{base}/github.wasm");
     let release_json = serde_json::to_vec(&json!({
         "id": "github",
-        "version": "0.1.0",
+        "version": github_manifest_version(),
         "wit-api": "0.1.0",
         "component_url": component_url,
         "component_sha256": sha,
@@ -258,16 +268,20 @@ async fn github_release_signs_installs_and_loads_through_the_generic_pipeline() 
         .expect("install must succeed for a correctly signed github release");
 
     // The release verified and activated.
+    let version = github_manifest_version();
     assert_eq!(record.plugin_id, "github");
-    assert_eq!(record.version, "0.1.0");
+    assert_eq!(record.version, version);
     assert!(record.active);
     assert_eq!(record.signing_key_id, FIRST_PARTY_KEY_ID);
 
-    // Installed to <root>/github/0.1.0 with the active pointer set.
-    assert!(root.path().join("github/0.1.0/github.wasm").is_file());
+    // Installed to <root>/github/<version> with the active pointer set.
+    assert!(root
+        .path()
+        .join(format!("github/{version}/github.wasm"))
+        .is_file());
     assert_eq!(
         std::fs::read_to_string(root.path().join("github/current")).unwrap(),
-        "0.1.0"
+        version
     );
 
     // The ledger row is active.
@@ -278,7 +292,7 @@ async fn github_release_signs_installs_and_loads_through_the_generic_pipeline() 
             .unwrap()
             .unwrap()
             .version,
-        "0.1.0"
+        version
     );
 
     // load_active_bundles surfaces it, with the real manifest (including the
@@ -288,7 +302,7 @@ async fn github_release_signs_installs_and_loads_through_the_generic_pipeline() 
         .iter()
         .find(|b| b.manifest.id == "github")
         .expect("the installed github bundle must be discovered");
-    assert_eq!(gh.release.version, "0.1.0");
+    assert_eq!(gh.release.version, version);
     assert_eq!(gh.manifest.oauth.len(), 1);
     assert_eq!(gh.manifest.oauth[0].id, "github");
 }

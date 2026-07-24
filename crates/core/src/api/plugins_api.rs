@@ -391,7 +391,7 @@ async fn update_all_plugins(cp: &ControlPlane) -> anyhow::Result<Vec<UpdateOutco
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
-        PluginSource::Catalog | PluginSource::RemoteCatalog => "catalog",
+        PluginSource::Component => "component",
         PluginSource::SkillPack(_) => "skill-pack",
     }
 }
@@ -419,18 +419,6 @@ fn derive_kind(plugin: &CorePlugin) -> Option<&'static str> {
         return Some("gateway");
     }
     Some("integration")
-}
-
-/// `PluginInfo.catalogSource` for a plugin's binding source: `embedded` for
-/// the compiled-in catalog, `remote` for a signed-feed entry that won a
-/// version-gated merge (`crate::plugins::catalog::merged_catalog_plugins`),
-/// `None` for builtins and skill packs — neither catalog ever produces them.
-fn catalog_source_label(source: &PluginSource) -> Option<String> {
-    match source {
-        PluginSource::Catalog => Some("embedded".to_string()),
-        PluginSource::RemoteCatalog => Some("remote".to_string()),
-        PluginSource::Builtin | PluginSource::SkillPack(_) => None,
-    }
 }
 
 /// Family head id for a provider plugin (`anthropic-oauth` → `anthropic`).
@@ -548,7 +536,9 @@ fn plugin_info(
         installed_at: ledger.installed_at,
         updated_at: ledger.updated_at,
         trust_tier: ledger.trust_tier,
-        catalog_source: catalog_source_label(&plugin.source),
+        component_backed: crate::plugins::component_catalog::is_component_bundle(
+            &plugin.manifest.id,
+        ),
         catalog_version: remote.map(|r| r.version.clone()),
         blocked_reason: remote.and_then(|r| r.blocked_reason.clone()),
     }
@@ -1360,9 +1350,9 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             installed_at: ledger.installed_at,
             updated_at: ledger.updated_at,
             trust_tier: ledger.trust_tier,
-            // A synthesized curated pack is never sourced from either
-            // catalog (it resolves via git clone, not a manifest feed).
-            catalog_source: None,
+            // A synthesized curated pack resolves via git clone, so it is
+            // never a component bundle and never came from a manifest feed.
+            component_backed: false,
             catalog_version: None,
             blocked_reason: None,
         });
@@ -1700,6 +1690,13 @@ async fn plugin_release_detail(
     } else {
         None
     };
+    let active_manifest = match active_manifest {
+        Some(mut manifest) => {
+            enrich_oauth_profile_status(cp.store(), plugin_id, &mut manifest).await;
+            Some(manifest)
+        }
+        None => None,
+    };
     Ok(ComponentReleaseDetail {
         plugin_id: plugin_id.to_string(),
         releases: releases
@@ -1709,6 +1706,36 @@ async fn plugin_release_detail(
         active_version,
         active_manifest,
     })
+}
+
+/// Enrich each OAuth profile with live connection status from the store: whether
+/// a usable token is stored (`connected`) and whether a client id resolves
+/// (`client_id_configured` — manifest baked-in OR a stored per-install
+/// override). The pure manifest `From` cannot see the store, so it leaves
+/// `connected=false` and `client_id_configured` = the manifest's baked-in value
+/// only; this ORs in the stored-override and token facts.
+async fn enrich_oauth_profile_status(
+    store: &Store,
+    plugin_id: &str,
+    manifest: &mut ComponentManifestInfo,
+) {
+    for profile in &mut manifest.oauth_profiles {
+        profile.connected = store
+            .get_plugin_oauth_profile_token(plugin_id, &profile.id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|tok| !tok.reconnect_required);
+        if !profile.client_id_configured {
+            profile.client_id_configured = store
+                .get_plugin_oauth_profile_client(plugin_id, &profile.id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|c| c.client_id)
+                .is_some_and(|id| !id.is_empty());
+        }
+    }
 }
 
 /// Install (or update to) a component plugin's signed release via the Task 11a
@@ -2128,7 +2155,7 @@ mod tests {
             connector: None,
             extension: None,
             provider: None,
-            source: PluginSource::Catalog,
+            source: PluginSource::Component,
         }
     }
 
@@ -2209,7 +2236,7 @@ mod tests {
     #[test]
     fn source_label_maps_every_variant() {
         assert_eq!(source_label(&PluginSource::Builtin), "builtin");
-        assert_eq!(source_label(&PluginSource::Catalog), "catalog");
+        assert_eq!(source_label(&PluginSource::Component), "component");
         assert_eq!(
             source_label(&PluginSource::SkillPack(std::path::PathBuf::from("/x"))),
             "skill-pack"
@@ -2229,7 +2256,7 @@ mod tests {
     #[test]
     fn derive_kind_integration_for_connector_without_skill_pack_source() {
         let mut plugin = connector_only("acme-conn");
-        plugin.source = PluginSource::Catalog;
+        plugin.source = PluginSource::Component;
         assert_eq!(derive_kind(&plugin), Some("integration"));
     }
 
@@ -2440,7 +2467,6 @@ mod tests {
         assert!(info.source_spec.is_none());
         // Builtin source, no cached remote-catalog row → all three enrichment
         // fields stay unset.
-        assert!(info.catalog_source.is_none());
         assert!(info.catalog_version.is_none());
         assert!(info.blocked_reason.is_none());
         // No manifest `slot` claim → neither field is set.
@@ -2473,25 +2499,6 @@ mod tests {
         assert!(!loser.owns_slot);
     }
 
-    // ---------- catalog_source_label ----------
-
-    #[test]
-    fn catalog_source_label_maps_catalog_sources_only() {
-        assert_eq!(
-            catalog_source_label(&PluginSource::Catalog).as_deref(),
-            Some("embedded")
-        );
-        assert_eq!(
-            catalog_source_label(&PluginSource::RemoteCatalog).as_deref(),
-            Some("remote")
-        );
-        assert!(catalog_source_label(&PluginSource::Builtin).is_none());
-        assert!(
-            catalog_source_label(&PluginSource::SkillPack(std::path::PathBuf::from("/x")))
-                .is_none()
-        );
-    }
-
     // ---------- remote-catalog enrichment (assemble_list) ----------
 
     // A plugin whose `CorePlugin.source` is `RemoteCatalog` (the merged-catalog
@@ -2506,7 +2513,7 @@ mod tests {
         let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
         let mut plugin = gateway_only("acme-remote");
-        plugin.source = PluginSource::RemoteCatalog;
+        plugin.source = PluginSource::Component;
         regs.add_plugin(plugin);
         let cp = {
             let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
@@ -2533,29 +2540,11 @@ mod tests {
             .iter()
             .find(|p| p.id == "acme-remote")
             .expect("acme-remote present in the list");
-        assert_eq!(info.catalog_source.as_deref(), Some("remote"));
         assert_eq!(info.catalog_version.as_deref(), Some("2.0.0"));
         assert_eq!(
             info.blocked_reason.as_deref(),
             Some("revoked: CVE-2026-0001")
         );
-    }
-
-    // An embedded-catalog plugin with NO matching cached remote row must still
-    // report `catalogSource: "embedded"`, with the version/blocked fields left
-    // unset — the remote cache only ever adds detail, never required for the
-    // embedded label.
-    #[tokio::test]
-    async fn assemble_list_labels_embedded_catalog_plugin_without_remote_row() {
-        let cp = test_cp().await;
-        let list = assemble_list(&cp).await.unwrap();
-        // `test_cp` registers the embedded catalog via `install_builtins`;
-        // "notion" is a catalog-sourced integration (see
-        // `plugin_info_configured_for_oauth_requires_stored_token_without_reconnect`).
-        let notion = list.iter().find(|p| p.id == "notion").expect("notion");
-        assert_eq!(notion.catalog_source.as_deref(), Some("embedded"));
-        assert!(notion.catalog_version.is_none());
-        assert!(notion.blocked_reason.is_none());
     }
 
     // ---------- auth_kind_label / auth_configured ----------
@@ -2858,6 +2847,63 @@ mod tests {
 
     // ---------- assemble_list / assemble_detail (ControlPlane-backed) ----------
 
+    /// A connector-capable plugin that authenticates the given way. Tests that
+    /// need a specific plugin SHAPE (oauth, a token setting, a real connector
+    /// capability) build one here rather than depending on a shipped
+    /// integration id — the embedded declarative catalog that used to supply
+    /// `notion`/`github` for this purpose no longer exists.
+    fn auth_connector(id: &str, kind: AuthKind, setting: Option<&str>) -> CorePlugin {
+        auth_connector_full(id, kind, setting, None)
+    }
+
+    /// Like [`auth_connector`] but also sets `auth.resource`, which flips an
+    /// OAuth plugin from "external" (client id → its `auth.setting`) to
+    /// "resource-declared" (client id → the `plugin_oauth_clients` row) — the
+    /// distinction `set_plugin_oauth_client_id` routes on.
+    fn auth_connector_full(
+        id: &str,
+        kind: AuthKind,
+        setting: Option<&str>,
+        resource: Option<&str>,
+    ) -> CorePlugin {
+        let mut manifest = manifest(id);
+        manifest.auth = Some(AuthSpec {
+            kind,
+            setting: setting.map(|s| s.to_string()),
+            resource: resource.map(|s| s.to_string()),
+            ..Default::default()
+        });
+        CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: Some(Arc::new(FakeConnector)),
+            extension: None,
+            provider: None,
+            source: PluginSource::Component,
+        }
+    }
+
+    /// [`test_cp`] plus caller-supplied plugins, registered FIRST so they win
+    /// their ids over anything `install_builtins` adds.
+    async fn test_cp_with(extra: Vec<CorePlugin>) -> Arc<ControlPlane> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::Store::open(tmp.path()).await.unwrap());
+        let mut regs = Registries::new();
+        regs.add_plugin(crate::harness::native::native_plugin());
+        for plugin in extra {
+            regs.add_plugin(plugin);
+        }
+        crate::plugins::install_builtins(&mut regs);
+        {
+            let persistence =
+                crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+                    .await
+                    .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        }
+    }
+
     async fn test_cp() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::Store::open(tmp.path()).await.unwrap());
@@ -2953,14 +2999,13 @@ mod tests {
     #[tokio::test]
     async fn plugin_info_configured_for_oauth_requires_stored_token_without_reconnect() {
         crate::llm_router::secrets::use_test_key_file();
-        let cp = test_cp().await;
-        // notion is a catalog kind=oauth plugin.
-        let before = assemble_detail(&cp, "notion").await.unwrap();
+        let cp = test_cp_with(vec![auth_connector("acme-oauth", AuthKind::Oauth, None)]).await;
+        let before = assemble_detail(&cp, "acme-oauth").await.unwrap();
         assert!(!before.info.configured);
 
         cp.store()
             .upsert_plugin_oauth_token(&PluginOauthToken {
-                plugin_id: "notion".into(),
+                plugin_id: "acme-oauth".into(),
                 access_token: "tok".into(),
                 refresh_token: None,
                 token_type: "Bearer".into(),
@@ -2970,14 +3015,14 @@ mod tests {
             })
             .await
             .unwrap();
-        let with_token = assemble_detail(&cp, "notion").await.unwrap();
+        let with_token = assemble_detail(&cp, "acme-oauth").await.unwrap();
         assert!(with_token.info.configured);
 
         cp.store()
-            .mark_plugin_oauth_reconnect_required("notion")
+            .mark_plugin_oauth_reconnect_required("acme-oauth")
             .await
             .unwrap();
-        let reconnect = assemble_detail(&cp, "notion").await.unwrap();
+        let reconnect = assemble_detail(&cp, "acme-oauth").await.unwrap();
         assert!(
             !reconnect.info.configured,
             "reconnect_required must unset configured"
@@ -3052,26 +3097,38 @@ mod tests {
 
     #[tokio::test]
     async fn uninstall_integration_clears_credential_and_disables() {
-        let cp = test_cp().await;
+        // A connector-capable, token-authenticated plugin: the shape `github`
+        // used to have as a declarative catalog entry. It is a WASM component
+        // now (manifest-only, so always-enabled), hence the synthetic stand-in.
+        let cp = test_cp_with(vec![auth_connector(
+            "acme-token",
+            AuthKind::Token,
+            Some("plugin.acme-token.token"),
+        )])
+        .await;
         cp.store()
-            .set_setting_raw("plugin.github.token", "tok")
+            .set_setting_raw("plugin.acme-token.token", "tok")
             .await
             .unwrap();
         let settings = SettingsStore::new(cp.store().clone());
-        crate::plugins::toggle_enabled(cp.plugins(), &settings, "github", true)
+        crate::plugins::toggle_enabled(cp.plugins(), &settings, "acme-token", true)
             .await
             .unwrap();
 
-        uninstall(&cp, "github").await.unwrap();
+        uninstall(&cp, "acme-token").await.unwrap();
 
         assert_eq!(
             cp.store()
-                .get_setting_raw("plugin.github.token")
+                .get_setting_raw("plugin.acme-token.token")
                 .await
                 .unwrap(),
             None
         );
-        assert!(!cp.plugins().is_enabled(&settings, "github").await.unwrap());
+        assert!(!cp
+            .plugins()
+            .is_enabled(&settings, "acme-token")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -3425,50 +3482,60 @@ mod tests {
 
     #[tokio::test]
     async fn set_plugin_oauth_client_id_routes_external_to_auth_setting_and_others_to_the_row() {
-        let cp = test_cp().await;
-        // google-workspace is the external-OAuth catalog plugin — its client id
-        // key IS its auth.setting (validated write path).
+        // Two synthetic shapes stand in for the removed catalog entries:
+        // `acme-external` declares an `auth.setting`, so its client id IS that
+        // setting; `acme-row` declares none, so it falls through to the
+        // `plugin_oauth_clients` row.
+        let cp = test_cp_with(vec![
+            auth_connector(
+                "acme-external",
+                AuthKind::Oauth,
+                Some("plugin.acme-external.client_id"),
+            ),
+            auth_connector_full("acme-row", AuthKind::Oauth, None, Some("https://acme/api")),
+        ])
+        .await;
         set_plugin_oauth_client_id(
             &cp,
-            "google-workspace".to_string(),
-            " google-client-1 ".to_string(),
+            "acme-external".to_string(),
+            " acme-client-1 ".to_string(),
         )
         .await
         .unwrap();
         assert_eq!(
             cp.store()
-                .get_setting_raw("plugin.google-workspace.client_id")
+                .get_setting_raw("plugin.acme-external.client_id")
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("google-client-1"),
+            Some("acme-client-1"),
             "trimmed value stored under the declared auth.setting"
         );
         assert!(
             cp.store()
-                .get_plugin_oauth_client("google-workspace")
+                .get_plugin_oauth_client("acme-external")
                 .await
                 .unwrap()
                 .is_none(),
             "external plugins never write the row"
         );
 
-        // notion (resource-declared oauth) goes to plugin_oauth_clients.
-        set_plugin_oauth_client_id(&cp, "notion".to_string(), "notion-client-1".to_string())
+        // A plugin with no auth.setting goes to plugin_oauth_clients.
+        set_plugin_oauth_client_id(&cp, "acme-row".to_string(), "acme-row-client-1".to_string())
             .await
             .unwrap();
         let row = cp
             .store()
-            .get_plugin_oauth_client("notion")
+            .get_plugin_oauth_client("acme-row")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.client_id.as_deref(), Some("notion-client-1"));
+        assert_eq!(row.client_id.as_deref(), Some("acme-row-client-1"));
         assert!(row.authorize_url.is_none());
 
         // Empty input is rejected.
         assert!(
-            set_plugin_oauth_client_id(&cp, "notion".to_string(), "  ".to_string())
+            set_plugin_oauth_client_id(&cp, "acme-row".to_string(), "  ".to_string())
                 .await
                 .is_err()
         );
@@ -3593,6 +3660,158 @@ mod tests {
         assert!(detail.releases.is_empty());
         assert!(detail.active_version.is_none());
         assert!(detail.active_manifest.is_none());
+    }
+
+    // The pure manifest -> `ComponentManifestInfo` conversion must carry the
+    // device-flow profile fields (token_url, device_authorization_url) and mark
+    // `client_id_configured` from a baked manifest client-id, leaving
+    // `connected` false (it cannot see the store).
+    #[test]
+    fn component_manifest_from_carries_profile_urls_and_baked_client_id() {
+        let manifest = ryuzi_plugin_sdk::PluginBundleManifest::from_toml(
+            r#"
+id = "github"
+name = "GitHub"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "per-call"
+component = "github.wasm"
+
+[[oauth]]
+id = "github"
+token-url = "https://github.com/login/oauth/access_token"
+device-authorization-url = "https://github.com/login/device/code"
+client-id = "Iv1.public"
+"#,
+        )
+        .unwrap();
+        let info = ComponentManifestInfo::from(manifest);
+        let p = &info.oauth_profiles[0];
+        assert_eq!(
+            p.token_url.as_deref(),
+            Some("https://github.com/login/oauth/access_token")
+        );
+        assert_eq!(
+            p.device_authorization_url.as_deref(),
+            Some("https://github.com/login/device/code")
+        );
+        assert!(
+            p.client_id_configured,
+            "baked manifest client-id => configured"
+        );
+        assert!(!p.connected, "pure From cannot see the store");
+    }
+
+    // Store enrichment: a usable stored token flips `connected`; a stored client
+    // id flips `client_id_configured` for a profile the manifest did not bake
+    // one into; a `reconnect_required` token is NOT connected; per-profile rows
+    // never bleed across ids.
+    #[tokio::test]
+    async fn enrich_oauth_profile_status_reflects_stored_token_and_client() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "github",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "github".into(),
+                profile_id: "custom".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("stored-id".into()),
+            })
+            .await
+            .unwrap();
+
+        let profile = |id: &str, baked: bool| ComponentOauthProfileInfo {
+            id: id.to_string(),
+            scopes: vec![],
+            token_url: None,
+            device_authorization_url: None,
+            connected: false,
+            client_id_configured: baked,
+        };
+        let mut manifest = ComponentManifestInfo {
+            publisher: "Ryuzi".into(),
+            description: String::new(),
+            lifecycle: "per-call".into(),
+            domains: vec![],
+            oauth_profiles: vec![
+                profile("github", true),
+                profile("custom", false),
+                profile("unset", false),
+            ],
+        };
+
+        enrich_oauth_profile_status(store, "github", &mut manifest).await;
+
+        let github = &manifest.oauth_profiles[0];
+        assert!(github.connected, "seeded token => connected");
+        assert!(github.client_id_configured);
+        let custom = &manifest.oauth_profiles[1];
+        assert!(!custom.connected, "no token for this profile");
+        assert!(custom.client_id_configured, "stored client => configured");
+        let unset = &manifest.oauth_profiles[2];
+        assert!(!unset.connected);
+        assert!(
+            !unset.client_id_configured,
+            "no manifest baked-in and no stored client => not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_marks_a_reconnect_required_token_as_not_connected() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "github",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: true,
+                },
+            )
+            .await
+            .unwrap();
+        let mut manifest = ComponentManifestInfo {
+            publisher: "Ryuzi".into(),
+            description: String::new(),
+            lifecycle: "per-call".into(),
+            domains: vec![],
+            oauth_profiles: vec![ComponentOauthProfileInfo {
+                id: "github".into(),
+                scopes: vec![],
+                token_url: None,
+                device_authorization_url: None,
+                connected: false,
+                client_id_configured: true,
+            }],
+        };
+        enrich_oauth_profile_status(store, "github", &mut manifest).await;
+        assert!(
+            !manifest.oauth_profiles[0].connected,
+            "a reconnect_required token must not read as connected"
+        );
     }
 
     #[tokio::test]

@@ -511,13 +511,12 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let mut registries = Registries::new();
     registries.add_plugin(native_plugin());
     crate::plugins::install_providers(&mut registries);
-    // Merge the (version-gated) remote catalog cache over the embedded
-    // catalog before anything is added to the host — `Registries::add_plugin`
-    // is first-registration-wins with no removal, so the winner per id must
-    // already be decided (see `catalog::merged_catalog_plugins`'s doc). An
-    // empty/unreadable cache degrades to the embedded catalog alone.
-    let remote = store.list_remote_catalog().await.unwrap_or_default();
-    for plugin in crate::plugins::catalog::merged_catalog_plugins(&remote) {
+    // The first-party WASM component bundles, manifest-only, so an installed
+    // OR not-yet-installed bundle is enumerable through `list_plugins` (see
+    // `plugins::component_catalog`). Added AFTER providers because
+    // `Registries::add_plugin` is first-registration-wins and a colliding
+    // provider component must never displace its builtin's richer manifest.
+    for plugin in crate::plugins::component_catalog::component_catalog_plugins() {
         registries.add_plugin(plugin);
     }
     crate::plugins::load_skill_pack_plugins(&mut registries);
@@ -2059,24 +2058,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_daemon_merges_remote_catalog_cache_over_the_embedded_catalog() {
+    async fn build_daemon_registers_first_party_component_bundles() {
         let (_guard, db_path) = temp_db_path();
-        const NEW_TOML: &str = "contract=1\nid=\"acme-remote\"\nname=\"Acme Remote\"\nversion=\"1.0.0\"\n[[mcp]]\nname=\"m\"\ntransport=\"http\"\nurl=\"https://x\"";
-        {
-            let store = Store::open(&db_path).await.unwrap();
-            store
-                .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
-                    id: "acme-remote".to_string(),
-                    manifest_toml: NEW_TOML.to_string(),
-                    version: "1.0.0".to_string(),
-                    sequence: 1,
-                    blocked: false,
-                    blocked_reason: None,
-                    fetched_at: 0,
-                }])
-                .await
-                .unwrap();
-        }
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
@@ -2096,10 +2079,16 @@ mod tests {
             .iter()
             .map(|p| p.manifest.id.clone())
             .collect();
-        assert!(
-            ids.contains(&"acme-remote".to_string()),
-            "remote catalog cache entry must be merged into the running host: {ids:?}"
-        );
+        // `build_daemon` composes its registries inline rather than calling
+        // `install_builtins`, so this guards the real composition root: without
+        // the component-catalog step here, a bundle would be invisible to
+        // `list_plugins` in the shipping app even though unit tests passed.
+        for id in ["github", "atlassian", "bitbucket", "discord"] {
+            assert!(
+                ids.contains(&id.to_string()),
+                "component bundle `{id}` must be registered by build_daemon: {ids:?}"
+            );
+        }
     }
 
     /// Track D hermeticity: `build_daemon` must never spawn a real extension
