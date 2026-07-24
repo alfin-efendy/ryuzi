@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.0](https://github.com/alfin-efendy/ryuzi/compare/v0.7.0...v0.8.0) (2026-07-24)
+
+
+### Features
+
+* Phase 6 — GitHub connector, WASM WebSocket capability + Discord gateway migration, Atlassian/Bitbucket connectors ([#165](https://github.com/alfin-efendy/ryuzi/issues/165)) ([e9caca2](https://github.com/alfin-efendy/ryuzi/commit/e9caca2dcc9b8cd8f0a91ded6d8b42e9595a1944))
+* **plugins:** component catalog migration + end-to-end OAuth connect ([#169](https://github.com/alfin-efendy/ryuzi/issues/169)) ([ba6612a](https://github.com/alfin-efendy/ryuzi/commit/ba6612a93f356e6b8be5cbf2221415954603e55c))
+* WASM Component Plugin Platform — signed bundles, generic adapters, bootstrap providers & Cockpit UX (Phases 1–5) ([#163](https://github.com/alfin-efendy/ryuzi/issues/163)) ([4993ae1](https://github.com/alfin-efendy/ryuzi/commit/4993ae1b81a488490669abf2c72d2b2625ce3313))
+
 ## [0.7.0](https://github.com/alfin-efendy/ryuzi/compare/v0.6.0...v0.7.0) (2026-07-18)
 
 
