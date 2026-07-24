@@ -6263,3 +6263,132 @@ async fn worktree_dir_setting_overrides_the_default_worktree_root() {
         custom_root.path().display()
     );
 }
+
+/// A gateway that records how many times `stop()` was called, so the
+/// control-plane revocation accessor can be asserted to reach exactly the right
+/// registered gateway by id.
+struct StopRecordingGateway {
+    id: String,
+    stops: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl crate::gateway::Gateway for StopRecordingGateway {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn start(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn stop(&self) -> anyhow::Result<()> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
+        Ok(format!("ws-{name}"))
+    }
+    async fn create_conversation(&self, _w: &str, _t: &str) -> anyhow::Result<String> {
+        Ok("conv".to_string())
+    }
+    async fn post_status(
+        &self,
+        surface: &crate::domain::Surface,
+        _text: &str,
+    ) -> anyhow::Result<crate::gateway::MessageRef> {
+        Ok(crate::gateway::MessageRef {
+            surface: surface.clone(),
+            message_id: "m1".to_string(),
+        })
+    }
+    async fn edit_status(
+        &self,
+        _msg: &crate::gateway::MessageRef,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_result(
+        &self,
+        _surface: &crate::domain::Surface,
+        _chunks: &[String],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_error(
+        &self,
+        _surface: &crate::domain::Surface,
+        _message: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn request_approval(
+        &self,
+        _s: &crate::domain::Surface,
+        _r: &crate::domain::ApprovalRequest,
+    ) -> anyhow::Result<ApprovalDecision> {
+        Ok(ApprovalDecision::Cancel)
+    }
+}
+
+/// The control-plane accessor the revocation entry points call must gracefully
+/// stop a REGISTERED, running gateway whose id was revoked, leave an unrelated
+/// registered gateway usable, and treat a revoked id with no registered gateway
+/// as a clean no-op.
+#[tokio::test]
+async fn stop_revoked_running_gateways_stops_registered_gateway_by_id() {
+    let (cp, _store, _prompts, _db) = fake_control_plane().await;
+
+    let discord = Arc::new(StopRecordingGateway {
+        id: "discord".to_string(),
+        stops: Arc::new(AtomicUsize::new(0)),
+    });
+    let slack = Arc::new(StopRecordingGateway {
+        id: "slack".to_string(),
+        stops: Arc::new(AtomicUsize::new(0)),
+    });
+    let discord_stops = Arc::clone(&discord.stops);
+    let slack_stops = Arc::clone(&slack.stops);
+
+    let gateways: Vec<Arc<dyn crate::gateway::Gateway>> = vec![
+        discord as Arc<dyn crate::gateway::Gateway>,
+        slack as Arc<dyn crate::gateway::Gateway>,
+    ];
+    cp.register_gateways(&gateways);
+
+    // Revoke the discord gateway plus a connector id that has no registered
+    // gateway ("acme"): only the running discord gateway is stopped.
+    let revoked: std::collections::HashSet<String> = ["discord".to_string(), "acme".to_string()]
+        .into_iter()
+        .collect();
+    let stopped = cp.stop_revoked_running_gateways(&revoked).await;
+
+    assert_eq!(
+        discord_stops.load(Ordering::SeqCst),
+        1,
+        "the revoked, registered gateway must be gracefully stopped"
+    );
+    assert_eq!(
+        slack_stops.load(Ordering::SeqCst),
+        0,
+        "an unrelated registered gateway must stay usable"
+    );
+    assert_eq!(
+        stopped,
+        vec!["discord".to_string()],
+        "only the revoked, running gateway is reported stopped ('acme' has no gateway)"
+    );
+}
+
+/// Before any gateway is registered (or a revoked id that names nothing), the
+/// accessor is a clean no-op — never a panic.
+#[tokio::test]
+async fn stop_revoked_running_gateways_is_a_noop_with_no_registered_gateways() {
+    let (cp, _store, _prompts, _db) = fake_control_plane().await;
+    let revoked: std::collections::HashSet<String> =
+        std::iter::once("discord".to_string()).collect();
+    let stopped = cp.stop_revoked_running_gateways(&revoked).await;
+    assert!(
+        stopped.is_empty(),
+        "revoking an id with no registered gateway must be a clean no-op"
+    );
+}

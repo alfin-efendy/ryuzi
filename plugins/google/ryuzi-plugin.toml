@@ -1,0 +1,29 @@
+id = "google"
+name = "Google (Gemini)"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "google.wasm"
+publisher = "Ryuzi"
+description = "Google Gemini chat provider. Talks to generativelanguage.googleapis.com with the user's stored API key, which the host injects through ryuzi:provider-auth — the component never sees the key."
+
+# The LLM-router provider id(s) this bundle backs. Declaring it EXPLICITLY is
+# what authorizes the host-mediated `ryuzi:provider-auth` capability
+# (`HostPolicy::for_installed_bundle` requires a non-empty `provider-ids` AND a
+# network host; the `[id]` fallback used for transport registration
+# deliberately does NOT grant credential access).
+provider-ids = ["google"]
+
+# The `google` descriptor sets `free_tier: true` — Gemini offers a genuinely
+# free usage path — but it is still an API-KEY provider: the user supplies a key
+# and the host injects it. That badge changes the UI, not this component.
+
+# The only host the component may reach — the host of the `google`
+# descriptor's `base_url`
+# (`https://generativelanguage.googleapis.com/v1beta/openai`).
+# The host enforces this allowlist on every credentialed request and
+# re-checks it on each redirect hop, so the user's API key can only ever
+# travel to generativelanguage.googleapis.com. Covers both the `/models` and
+# `/chat/completions` endpoints under the OpenAI-compatibility path.
+[permissions]
+network = ["generativelanguage.googleapis.com"]

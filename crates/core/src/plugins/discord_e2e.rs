@@ -404,6 +404,7 @@ async fn the_real_discord_component_instantiates_with_websocket_linked() {
             .map(|n| n.0.clone())
             .collect(),
         oauth_profile_ids: vec![],
+        provider_ids: vec![],
     });
 
     // THE key assertion: instantiation succeeds — proving all four capability

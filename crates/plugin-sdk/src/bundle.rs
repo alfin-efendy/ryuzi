@@ -42,6 +42,22 @@ pub struct PluginBundleManifest {
     pub permissions: PluginPermissions,
     #[serde(default)]
     pub oauth: Vec<OAuthProfile>,
+    /// The LLM-router provider id(s) a provider bundle serves. A provider
+    /// component often serves a router id that differs from its bundle `id`
+    /// (e.g. the `mimo` bundle backs the `mimo-free` router provider), so this
+    /// lets the bundle DECLARE those ids rather than the host hardcoding a
+    /// `bundle-id -> provider-id` mapping. Optional and empty by default: an
+    /// existing manifest that omits it keeps working, falling back to `[id]`
+    /// via [`PluginBundleManifest::resolved_provider_ids`]. Ignored for
+    /// non-provider bundles.
+    ///
+    /// Declaring this EXPLICITLY is also what lets the host grant the bundle
+    /// the `ryuzi:provider-auth` capability (host-injected user API keys) — and
+    /// it bounds which providers' credentials the bundle may use. The `[id]`
+    /// fallback exists only for transport registration and never authorizes a
+    /// credential.
+    #[serde(default, rename = "provider-ids")]
+    pub provider_ids: Vec<String>,
 }
 
 /// How the host instances a bundle's component: one shared instance for
@@ -141,6 +157,8 @@ pub enum BundleError {
     EmptyOAuthProfileId,
     #[error("duplicate oauth profile id: {0}")]
     DuplicateOAuthProfile(String),
+    #[error("invalid provider id: {0:?}")]
+    InvalidProviderId(String),
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -198,6 +216,20 @@ impl PluginBundleManifest {
         Ok(bundle)
     }
 
+    /// The LLM-router provider id(s) this bundle serves: the declared
+    /// [`PluginBundleManifest::provider_ids`] when non-empty, otherwise the
+    /// single-element fallback `[self.id]`. The host registers one provider
+    /// transport per returned id, so a bundle whose router id differs from its
+    /// bundle id (e.g. `mimo` -> `mimo-free`) is resolved generically from the
+    /// manifest, never a host-side id branch.
+    pub fn resolved_provider_ids(&self) -> Vec<String> {
+        if self.provider_ids.is_empty() {
+            vec![self.id.clone()]
+        } else {
+            self.provider_ids.clone()
+        }
+    }
+
     /// Structural validation: id shape, required fields, `version` and
     /// `wit-api` semver parsing, non-empty `component`, a well-formed
     /// network allowlist, and unique OAuth profile ids.
@@ -229,6 +261,16 @@ impl PluginBundleManifest {
             }
             if !seen_oauth_ids.insert(profile.id.as_str()) {
                 return Err(BundleError::DuplicateOAuthProfile(profile.id.clone()));
+            }
+        }
+
+        // A declared router provider id must be a well-formed id (the same
+        // lowercase/digit/hyphen grammar as the bundle `id`): non-empty, no
+        // whitespace, no uppercase. Empty is allowed (the whole list is
+        // optional); each present entry is checked.
+        for provider_id in &self.provider_ids {
+            if !is_valid_id(provider_id) {
+                return Err(BundleError::InvalidProviderId(provider_id.clone()));
             }
         }
 
@@ -486,6 +528,79 @@ id = ""
         let err = PluginBundleManifest::from_toml(toml_str)
             .expect_err("empty oauth profile id should fail validation");
         assert!(matches!(err, BundleError::EmptyOAuthProfileId));
+    }
+
+    #[test]
+    fn parses_declared_provider_ids() {
+        let toml_str = r#"
+id = "mimo"
+name = "MiMo"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "per-call"
+component = "mimo.wasm"
+provider-ids = ["mimo-free"]
+"#;
+        let bundle = PluginBundleManifest::from_toml(toml_str)
+            .expect("a bundle declaring provider-ids should validate");
+        assert_eq!(bundle.provider_ids, vec!["mimo-free".to_string()]);
+        assert_eq!(
+            bundle.resolved_provider_ids(),
+            vec!["mimo-free".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_ids_default_to_the_manifest_id_when_absent() {
+        // A pre-existing manifest with no `provider-ids` key keeps working: the
+        // field defaults to empty and the accessor falls back to `[id]`.
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+component = "acme.wasm"
+"#;
+        let bundle = PluginBundleManifest::from_toml(toml_str)
+            .expect("a manifest without provider-ids must still validate");
+        assert!(bundle.provider_ids.is_empty());
+        assert_eq!(bundle.resolved_provider_ids(), vec!["acme".to_string()]);
+    }
+
+    #[test]
+    fn resolved_provider_ids_honors_multiple_declared_entries() {
+        let toml_str = r#"
+id = "multi"
+name = "Multi"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "per-call"
+component = "multi.wasm"
+provider-ids = ["one-free", "two-free"]
+"#;
+        let bundle = PluginBundleManifest::from_toml(toml_str)
+            .expect("multiple provider-ids should validate");
+        assert_eq!(
+            bundle.resolved_provider_ids(),
+            vec!["one-free".to_string(), "two-free".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_provider_id() {
+        let toml_str = r#"
+id = "mimo"
+name = "MiMo"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "per-call"
+component = "mimo.wasm"
+provider-ids = ["Mimo Free"]
+"#;
+        let err = PluginBundleManifest::from_toml(toml_str)
+            .expect_err("an uppercase/whitespace provider id should fail validation");
+        assert!(matches!(err, BundleError::InvalidProviderId(id) if id == "Mimo Free"));
     }
 
     fn bundle_with_network(host: &str) -> String {

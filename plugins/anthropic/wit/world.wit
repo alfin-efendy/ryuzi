@@ -1,0 +1,23 @@
+package ryuzi:anthropic@0.1.0;
+
+// The narrow world the Anthropic provider component targets.
+//
+// It deliberately does NOT import `ryuzi:http/http`: every byte of egress goes
+// through `ryuzi:provider-auth/provider-auth`, so the HOST looks the user's
+// stored Anthropic API key up, injects it per the provider descriptor's auth
+// scheme (`x-api-key`), and hands the component only the upstream response. The
+// key never crosses into the guest, and the guest has no unauthenticated escape
+// hatch to the network either.
+//
+// `ryuzi:storage/storage` carries the OPTIONAL base-URL override (see
+// `logic::BASE_URL_STORAGE_KEY`) used both by compatible gateways and by the
+// provider conformance harness's mock upstream.
+//
+// The build materializes `wit/deps/` from the SDK the same way the fixtures do
+// (see scripts/plugins/build-first-party.ts).
+world anthropic {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:provider-auth/provider-auth@0.1.0;
+  import ryuzi:storage/storage@0.1.0;
+  export ryuzi:provider/provider@0.1.0;
+}

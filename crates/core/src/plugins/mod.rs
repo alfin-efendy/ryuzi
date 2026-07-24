@@ -40,6 +40,15 @@ pub mod wasm_hooks;
 pub mod wasm_provider;
 pub mod wit;
 
+/// Reusable provider-conformance harness (plan Task 16, Step 1): runs a
+/// provider component through the generic [`wasm_provider`] seam against a
+/// mocked, allowlisted HTTP upstream and verifies model listing,
+/// completion/order, auth absence, HTTP error mapping, and timeout mapping.
+/// Test-only, and proven against the synthetic `component-provider-http`
+/// fixture; later slices reuse it per real provider component.
+#[cfg(test)]
+mod wasm_provider_conformance;
+
 /// End-to-end proof that the REAL first-party GitHub connector component
 /// (`plugins/github`) signs, installs, enumerates its tools, and drives its
 /// host-managed OAuth through the GENERIC pipeline (Task 13b, Step 4). Kept in
@@ -222,6 +231,51 @@ pub(crate) fn build_bitbucket_component_once() {
             "bitbucket component build failed: {status}"
         );
     });
+}
+
+/// Build the first-party LLM PROVIDER component in `plugins/<plugin_dir>` to
+/// wasm32-wasip2 EXACTLY ONCE per test process, per directory. Sibling of
+/// [`build_atlassian_component_once`] — see that function's doc — but
+/// parameterized, because the provider migration ships one such bundle per
+/// OpenAI-format provider and they are otherwise built identically.
+///
+/// Consumed by the provider conformance battery
+/// (`crate::plugins::wasm_provider_conformance`), which drives each real
+/// component against a loopback mock upstream. The builds are serialized behind
+/// one mutex so concurrent conformance tests do not race cargo, and each
+/// directory is built at most once however many tests ask for it.
+#[cfg(test)]
+pub(crate) fn build_provider_component_once(plugin_dir: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static BUILT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut built = BUILT
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if built.contains(plugin_dir) {
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = root
+        .join("tests")
+        .join("fixtures")
+        .join("build-provider-component.sh");
+    let status = std::process::Command::new("sh")
+        .arg(script)
+        .arg(plugin_dir)
+        .status()
+        .expect("provider component build script should start");
+    assert!(
+        status.success(),
+        "{plugin_dir} component build failed: {status}"
+    );
+    // Recorded only AFTER the build succeeded. Recording it up front would
+    // make a FAILED build look done, so the next test in this process would
+    // skip the build and fail on a missing artifact instead of on the real
+    // compile error. The `assert!` above unwinds before this line, leaving the
+    // directory unrecorded so the next caller retries and sees the true error.
+    built.insert(plugin_dir.to_string());
 }
 
 /// Add every generated manifest-only builtin — every model provider
@@ -488,7 +542,7 @@ pub async fn apply_blocked_denylist(
     store: &Store,
     settings: &SettingsStore,
     host: &PluginHost,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let blocked: Vec<String> = store
         .list_remote_catalog()
         .await?
@@ -496,8 +550,8 @@ pub async fn apply_blocked_denylist(
         .filter(|r| r.blocked)
         .map(|r| r.id)
         .collect();
-    for id in blocked {
-        if host.get(&id).is_some() && host.is_enabled(settings, &id).await.unwrap_or(false) {
+    for id in &blocked {
+        if host.get(id).is_some() && host.is_enabled(settings, id).await.unwrap_or(false) {
             match settings.set(&format!("plugin.{id}.enabled"), "false").await {
                 Ok(()) => tracing::warn!("catalog: auto-disabled blocked plugin {id}"),
                 Err(e) => {
@@ -506,7 +560,54 @@ pub async fn apply_blocked_denylist(
             }
         }
     }
-    Ok(())
+    // The blocked ids are returned so a caller holding the daemon's live
+    // gateways can ALSO stop any running gateway among them at a safe boundary
+    // (`stop_revoked_gateways`) — the enable-flag flip above only takes effect
+    // on the next attach/restart.
+    Ok(blocked)
+}
+
+/// Gracefully stop every currently-running gateway whose plugin id was
+/// revoked/blocked, returning the ids actually stopped.
+///
+/// This closes the mid-session revocation gap: [`apply_blocked_denylist`] and
+/// the component-release revoke path flip the *enablement setting* (which only
+/// takes effect on the next attach/restart), but a long-lived WASM **gateway**
+/// keeps its supervisor running until then. Given the daemon's live gateways
+/// and the just-revoked id set, this disables the running ones at a SAFE
+/// boundary by calling each matching gateway's EXISTING graceful
+/// [`Gateway::stop`] — which, for a `WasmGateway`, stops the supervisor's
+/// component and aborts its task; no new teardown path is invented.
+///
+/// GENERIC by construction: it matches purely on [`Gateway::id`], never on a
+/// specific plugin id, so the migrated Discord gateway (or any future
+/// long-lived gateway component) is disabled the same way. A revoked id with no
+/// currently-running gateway — a connector/provider, or a gateway not presently
+/// supervised — matches nothing and is a clean no-op, never an error.
+///
+/// Resilient: a `stop()` that errors (e.g. it races a trap/restart the
+/// supervisor already guards) is logged and swallowed, never propagated — one
+/// gateway's stop can neither abort the sweep nor crash the daemon. The stopped
+/// id is still recorded either way, because `Gateway::stop` tears the
+/// supervisor down (aborts its task) even on the component-stop error path.
+pub async fn stop_revoked_gateways(
+    gateways: &[std::sync::Arc<dyn crate::gateway::Gateway>],
+    revoked_ids: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut stopped = Vec::new();
+    for gateway in gateways {
+        if !revoked_ids.contains(gateway.id()) {
+            continue;
+        }
+        if let Err(error) = gateway.stop().await {
+            tracing::warn!(
+                gateway = %gateway.id(),
+                "revocation: graceful stop of a revoked gateway errored (swallowed): {error}"
+            );
+        }
+        stopped.push(gateway.id().to_string());
+    }
+    stopped
 }
 
 #[cfg(test)]
@@ -594,6 +695,78 @@ mod toggle_enabled_tests {
     impl Connector for FakeConnector {
         async fn mcp_servers(&self, _ctx: &ConnectorCtx) -> anyhow::Result<Vec<McpServerSpec>> {
             Ok(vec![])
+        }
+    }
+
+    /// A `Gateway` that records how many times `stop()` was called, so a
+    /// revocation test can assert the live-stop mechanism reached exactly the
+    /// right gateway (and left unrelated ones untouched). `fail_stop` makes
+    /// `stop()` return an error so the sweep's resilience can be exercised.
+    struct RecordingGateway {
+        id: String,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
+        fail_stop: bool,
+    }
+    impl RecordingGateway {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                stops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail_stop: false,
+            }
+        }
+        fn failing(id: &str) -> Self {
+            Self {
+                fail_stop: true,
+                ..Self::new(id)
+            }
+        }
+        fn stops(&self) -> usize {
+            self.stops.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    #[async_trait]
+    impl Gateway for RecordingGateway {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        async fn start(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> anyhow::Result<()> {
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_stop {
+                anyhow::bail!("stop raced a trap/restart");
+            }
+            Ok(())
+        }
+        async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
+            Ok(format!("ws-{name}"))
+        }
+        async fn create_conversation(&self, _w: &str, _t: &str) -> anyhow::Result<String> {
+            Ok("conv".to_string())
+        }
+        async fn post_status(&self, surface: &Surface, _text: &str) -> anyhow::Result<MessageRef> {
+            Ok(MessageRef {
+                surface: surface.clone(),
+                message_id: "m1".to_string(),
+            })
+        }
+        async fn edit_status(&self, _msg: &MessageRef, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_result(&self, _surface: &Surface, _chunks: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_error(&self, _surface: &Surface, _message: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval(
+            &self,
+            _s: &Surface,
+            _r: &ApprovalRequest,
+        ) -> anyhow::Result<ApprovalDecision> {
+            Ok(ApprovalDecision::Cancel)
         }
     }
 
@@ -806,6 +979,85 @@ mod toggle_enabled_tests {
         assert!(
             err.to_string().contains("blocked"),
             "re-enabling a blocked plugin must be refused, got: {err}"
+        );
+        // The redacted revocation reason is preserved and surfaced verbatim, so
+        // an operator can read WHY the enable was refused.
+        assert!(
+            err.to_string().contains("revoked: compromised"),
+            "the refusal must carry the redacted revocation reason, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_revoked_gateways_stops_only_matching_ids_and_is_resilient() {
+        // A running gateway ("discord") is revoked; an unrelated running gateway
+        // ("slack") is not; a revoked connector id ("acme") has no running
+        // gateway at all. The mechanism must gracefully stop ONLY discord,
+        // leave slack usable, treat acme as a clean no-op, and never branch on a
+        // specific plugin id.
+        let discord = Arc::new(RecordingGateway::new("discord"));
+        let slack = Arc::new(RecordingGateway::new("slack"));
+        let gateways: Vec<Arc<dyn Gateway>> = vec![
+            Arc::clone(&discord) as Arc<dyn Gateway>,
+            Arc::clone(&slack) as Arc<dyn Gateway>,
+        ];
+
+        let revoked: std::collections::HashSet<String> =
+            ["discord".to_string(), "acme".to_string()]
+                .into_iter()
+                .collect();
+        let stopped = stop_revoked_gateways(&gateways, &revoked).await;
+
+        assert_eq!(
+            discord.stops(),
+            1,
+            "the revoked, running gateway must be stopped exactly once"
+        );
+        assert_eq!(
+            slack.stops(),
+            0,
+            "an unrelated gateway must stay running/usable"
+        );
+        assert_eq!(
+            stopped,
+            vec!["discord".to_string()],
+            "only the revoked, running gateway is reported stopped — the revoked connector id \
+             ('acme', no running gateway) is a clean no-op, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_revoked_gateways_swallows_a_failing_stop_and_finishes_the_sweep() {
+        // A stop that errors (racing a trap/restart) must NOT abort the sweep or
+        // propagate: a second revoked gateway after it must still be stopped.
+        let flaky = Arc::new(RecordingGateway::failing("discord"));
+        let other = Arc::new(RecordingGateway::new("slack"));
+        let gateways: Vec<Arc<dyn Gateway>> = vec![
+            Arc::clone(&flaky) as Arc<dyn Gateway>,
+            Arc::clone(&other) as Arc<dyn Gateway>,
+        ];
+        let revoked: std::collections::HashSet<String> =
+            ["discord".to_string(), "slack".to_string()]
+                .into_iter()
+                .collect();
+
+        let stopped = stop_revoked_gateways(&gateways, &revoked).await;
+
+        assert_eq!(
+            flaky.stops(),
+            1,
+            "the failing gateway's stop was still attempted"
+        );
+        assert_eq!(
+            other.stops(),
+            1,
+            "a stop error must not abort the rest of the sweep"
+        );
+        assert_eq!(
+            stopped.len(),
+            2,
+            "both revoked gateways are reported stopped — stop() aborts the supervisor even when \
+             the component-stop errors"
         );
     }
 

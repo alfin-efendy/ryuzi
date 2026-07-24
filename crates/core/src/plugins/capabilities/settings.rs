@@ -177,6 +177,7 @@ mod tests {
             telemetry: Arc::new(NoopTelemetry),
             network_allowlist: vec![],
             oauth_profile_ids: vec![],
+            provider_ids: vec![],
         }
     }
 

@@ -43,7 +43,10 @@ actual Rust code, so it is hand-built-in: the native agent harness
 component bundles discovered off-disk and driven through the generic host
 gateway bridge (`crates/core/src/plugins/wasm_gateway_bridge.rs`) — the
 first-party Discord gateway lives at `plugins/discord`; there is no native
-(in-process) gateway plugin.
+(in-process) gateway plugin. A *connector* can, separately, ALSO ship as a
+signed WASM component bundle instead of (or, for `github`/`atlassian`,
+alongside) a declarative manifest — a distinct, additive mechanism covered
+in [WASM component bundles](#wasm-component-bundles) below.
 
 Manifests come from three places, merged in this order (first registration
 for a given `id` wins — see `PluginHost::add`):
@@ -53,7 +56,10 @@ for a given `id` wins — see `PluginHost::add`):
    (`crates/core/src/plugins/providers.rs`).
 2. **The embedded integration catalog** — 24 TOML manifests baked into the
    binary via `include_str!`, at `crates/core/plugins/catalog/*.toml`
-   (`crates/core/src/plugins/catalog.rs`).
+   (`crates/core/src/plugins/catalog.rs`) — still including `github` and
+   `atlassian` as declarative, token-authenticated connectors; this list is
+   unrelated to the signed WASM component bundles under `plugins/<id>` (see
+   [WASM component bundles](#wasm-component-bundles) below).
 3. **Skill packs** — TOML manifests the skills installer materialized at
    `~/.config/ryuzi/plugins/<id>/ryuzi-plugin.toml`
    (`crates/core::plugins::load_skill_pack_plugins`), each gated on a
@@ -111,6 +117,14 @@ The remote feed can add new ids and override an embedded id's manifest at a
 strictly higher semver; it can never delete an embedded entry. A header
 "Refresh catalog" button and status line drive this on demand; see the
 linked section for the fetch cadence, signing, and publish flow.
+
+Signed WASM component bundles (gateways/connectors/providers — see [WASM
+component bundles](#wasm-component-bundles) below) are a separate, additive
+mechanism and do not appear in Browse at all. Today only `mimo`/`opencode`
+surface anywhere in Cockpit's UI for this mechanism, under the Installed
+tab's own "Component plugins" section (install/rollback buttons); `github`,
+`atlassian`, `bitbucket`, and `discord` component bundles have no Cockpit UI
+yet.
 
 Installing a skill pack (Browse card or "Add skill source") goes through the
 two-phase tiered trust gate described in
@@ -277,6 +291,16 @@ and a `${auth}` placeholder in `command`/`args` with no `[auth]` block
 `[provider]` is populated by the generated built-in provider plugins
 (`providers.rs`); none of the 24 embedded catalog manifests use it — a
 third-party integration is a connector, not a model provider.
+
+Separately from this declarative `[provider]` field, a model-provider
+capability can ALSO ship as a signed WASM component bundle — see [WASM
+component bundles](#wasm-component-bundles) below. That path is
+**transitional**: native `llm_router` routing remains the primary, default
+path for every provider; a routed connection only diverts to an in-process
+component when one is installed and enabled for that provider id (today
+that happens automatically only for the `mimo`/`opencode` free tiers — see
+below), and no provider component has been validated against a live vendor
+endpoint yet.
 
 ### Full annotated example
 
@@ -912,12 +936,20 @@ per-plugin case in either function.
 
 ## How built-ins map to plugins
 
+Every id's `CorePlugin` comes from one of the three `PluginHost` sources
+above. The last two rows below are a DIFFERENT thing — signed WASM component
+bundles are never `PluginHost` entries (see [WASM component
+bundles](#wasm-component-bundles)) — but are listed here too since they
+answer the same "where does id X come from" question.
+
 | Plugin id(s) | Source | Capability |
 | --- | --- | --- |
 | `native` | `harness::native::native_plugin()` | harness (in-process agent loop) |
 | `discord` | signed WASM component bundle (`plugins/discord`), discovered off-disk | gateway (via `wasm_gateway_bridge::WasmGateway`) |
 | `anthropic`, `openai`, `ollama`, ... (every `llm_router::registry::CATALOG` entry) | `plugins::providers::provider_plugins()` | manifest-only, `[provider]` block; category `model-provider` + `api-key`/`oauth`/`free` |
-| `github`, `atlassian`, ... (24 entries) | Embedded TOML, `plugins::catalog::catalog_plugins()` | connector (via `declarative_plugin`) |
+| `github`, `atlassian`, ... (24 entries) | Embedded TOML, `plugins::catalog::catalog_plugins()` | connector (via `declarative_plugin`) — `github`/`atlassian` ALSO have a separate WASM connector bundle, see below |
+| `github`, `atlassian`, `bitbucket` | signed WASM component bundle (`plugins/<id>`), discovered off-disk — NOT a `PluginHost` entry | connector (via `wasm_connector::WasmToolSet`, in-process session tools, not `[[mcp]]`) |
+| `mimo`, `opencode` (auto-installed); `openai`, `anthropic`, `qwen`, ... (Task-16c ports, installable but not auto-installed) | signed WASM component bundle (`plugins/<id>`), discovered off-disk — NOT a `PluginHost` entry | provider transport (via `wasm_provider`), diverts `llm_router` routing for its declared `provider-ids` when installed + enabled |
 
 ---
 
@@ -1213,6 +1245,234 @@ and `tool/call` for `"lint"`
 (`{"result":{"content":[{"type":"text","text":"0 problems"}]}}`, mirroring
 MCP's own tool-result shape) — and, ideally, `extension/shutdown` by
 exiting on its own within the shutdown grace period (5s).
+
+---
+
+## WASM component bundles
+
+A third extension mechanism exists alongside the declarative catalog/
+skill-pack manifests above and Track D's supervised extension subprocesses:
+a **signed WASM component bundle** — a compiled Wasmtime component that runs
+in-process, sandboxed by the Component Model's own import/export boundary
+rather than a subprocess. First-party bundle sources live under
+`plugins/<id>/` in this repo, one component export per role:
+
+| Role | WIT export | Bundle(s) |
+| --- | --- | --- |
+| Gateway | `ryuzi:gateway/gateway@0.1.0` | `discord` |
+| Connector | `ryuzi:connector/connector@0.1.0` | `github`, `atlassian`, `bitbucket` |
+| Provider | `ryuzi:provider/provider@0.1.0` | `mimo`, `opencode`, plus the Task-16c LLM-provider ports (`openai`, `openrouter`, `groq`, `deepseek`, `mistral`, `xai`, `nvidia`, `huggingface`, `google`, `anthropic`, `anthropic-oauth`, `qwen`) |
+
+Each bundle's own manifest is `ryuzi-plugin.toml` — the same filename as the
+declarative `PluginManifest` above, but a DIFFERENT schema
+(`ryuzi_plugin_sdk::bundle::PluginBundleManifest`,
+`crates/plugin-sdk/src/bundle.rs`): `id`, `name`, `version` (semver),
+`wit-api` (a semver RANGE the component targets), `lifecycle` (`singleton` /
+`per-session` / `per-call`), `component` (the compiled `.wasm` filename),
+`[permissions].network` (an outbound hostname allowlist), `[[oauth]]`
+profiles, and an optional `provider-ids` list — the LLM-router provider
+id(s) a provider bundle serves (e.g. the `mimo` bundle declares
+`provider-ids = ["mimo-free"]`; omitted, it falls back to `[id]` —
+`PluginBundleManifest::resolved_provider_ids`).
+
+**None of this goes through `PluginHost`/`Registries`.** Component bundles
+are discovered and wired entirely outside the three `CorePlugin` sources
+listed [above](#two-layers-manifest-vs-coreplugin): they never get a
+`PluginHost` entry, so they never appear in the `list_plugins`/
+`plugin_detail` RPCs Cockpit's Plugins hub reads (per
+`apps/cockpit/src/store-plugins.ts`'s own `FIRST_PARTY_BUNDLE_IDS` comment,
+which exists precisely because component bundles are otherwise invisible to
+those RPCs). Instead, each role is discovered and wired separately, straight
+out of `daemon::build_daemon`:
+
+- **Gateways** — `wasm_gateway_bridge::build_wasm_gateways` pushes one live
+  `Gateway` per enabled, discovered bundle straight into the daemon's own
+  gateway list (see [How built-ins map to plugins](#how-built-ins-map-to-plugins)
+  above).
+- **Connectors** — discovered per session start
+  (`ControlPlane::build_wasm_session_providers`) and surfaced as in-process
+  tools alongside Track D's extension tools via
+  `plugins::wasm_connector::WasmToolSet`, NOT as `[[mcp]]`-style external
+  servers — `wasm_connector`'s own module doc explains why: the Rust
+  `Connector` trait only yields pointers to *external* MCP servers and
+  structurally cannot represent a tool that runs in-process.
+- **Providers** — discovered once at daemon boot
+  (`plugins::wasm_provider::discover_provider_components`) and registered,
+  by router provider id, into a process-wide transport table;
+  `llm_router::client.rs` checks that table BEFORE its generic HTTP `match
+  target.desc.format` and diverts to the component when a transport is
+  registered for that connection's provider id — the exact "transitional,
+  native-primary" seam described [above](#provider-model-provider-plugins).
+
+All three share one enablement key: `plugin.<id>.enabled`
+(`plugins::host::component_plugin_enabled`) — the same setting-key
+convention a declarative catalog connector uses (see [Enabling
+plugins](#enabling-plugins)), but read directly rather than through
+`PluginHost::is_enabled`.
+
+### `github`/`atlassian`: two connectors coexist under the same id
+
+`github` and `atlassian` are each BOTH a declarative embedded-catalog
+connector (`crates/core/plugins/catalog/{github,atlassian}.toml`, still 2 of
+the 24 manifests in `CATALOG_MANIFESTS` — a token/PAT-authenticated HTTP MCP
+server pointed at the vendor's own hosted remote MCP endpoint, unchanged
+from before) AND a first-party WASM connector component (`plugins/github`,
+`plugins/atlassian` — OAuth-authenticated, in-process tools, no MCP server
+involved). The two are additive, not a replacement of one by the other, and
+— because they share the same id — both are gated by the same
+`plugin.<id>.enabled` setting if a deployment ever has both installed.
+`bitbucket` has no catalog manifest at all (verified: no `bitbucket.toml`
+under `crates/core/plugins/catalog/`, and it never had one) — it exists
+ONLY as a WASM connector component.
+
+### Installation, signing, and today's actual reach
+
+A bundle release ships as four artifacts — the manifest, the compiled
+`.wasm`, a `PluginRelease` JSON descriptor, and a `plugin.sig`
+detached-signature envelope over the release JSON's exact raw bytes —
+fetched and verified by `ComponentBundleInstaller`/`install_component_release`
+(`crates/core/src/plugins/{bundle,remote_catalog}.rs`) into
+`installed_bundle_root()` (`~/.config/ryuzi/plugins` by default). This
+mirrors the [remote catalog](#remote-catalog)'s feed-signing design one
+layer down — and, like that feed, **its trusted signing key is still the
+all-zero placeholder** (`FIRST_PARTY_KEY_ID` in
+`crates/core/src/plugins/first_party_key.rs`): `first_party_trusted_keys()`
+returns an EMPTY map while the placeholder is in place, so `verify_bundle`
+trusts nothing and NO first-party component — `mimo`, `opencode`, or any
+connector/gateway — can actually be installed in a real deployment until a
+maintainer completes the same one-time key-rollout step already documented
+under [Signing](#signing) above. This is a deliberate fail-closed default,
+not a bug.
+
+Two further gaps between "the generic machinery exists and is tested" and
+"a user can turn this on today":
+
+- **Auto-bootstrap and Cockpit's UI cover only `mimo`/`opencode`.**
+  `daemon::build_daemon` auto-installs `FIRST_PARTY_BUNDLE_IDS = ["mimo",
+  "opencode"]` on first run (`bootstrap_first_party_components`), and
+  Cockpit's Installed tab "Component plugins" section and its install/
+  rollback buttons only ever ask about those same two ids
+  (`apps/cockpit/src/store-plugins.ts`'s own `FIRST_PARTY_BUNDLE_IDS`
+  constant). `github`, `discord`, `atlassian`, and `bitbucket` are built and
+  signed by the same publish tooling (`scripts/plugins/build-first-party.ts`
+  lists all of them) and are each exercised end-to-end by a dedicated
+  integration-test suite that compiles and drives the real component
+  (`github_e2e.rs`, `atlassian_bitbucket_e2e.rs`, `discord_e2e.rs`) — but
+  none of them is in the auto-bootstrap list or reachable from a Cockpit
+  button today; installing one means calling the `install_component_plugin`
+  RPC directly.
+- **No provider component has been validated against a live vendor
+  endpoint.** The e2e suites prove the host-mediated OAuth/HTTP/
+  provider-auth plumbing end-to-end against mocks, and the router genuinely
+  diverts to a registered provider transport when one exists — but that is
+  "the seam is wired," not "shipped and proven against production APIs."
+  Treat every provider component as pre-production until stated otherwise.
+
+### Permission model
+
+`[permissions].network` is the only permission axis today (structurally
+extensible for a future axis without breaking existing bundles): a bare
+lowercase hostname (`api.github.com`) or a `*.`-prefixed wildcard
+(`*.github.com`) — no scheme, path, port, IP literal, bare `*`, or uppercase
+(`is_valid_network_host` in `crates/plugin-sdk/src/bundle.rs`).
+`HostPolicy::for_installed_bundle` (`crates/core/src/plugins/runtime.rs`)
+derives every capability grant straight from the manifest plus install
+provenance — no grant is ever caller-supplied:
+
+| Grant | Condition |
+| --- | --- |
+| `allow_network` / `allow_websocket` | Manifest declares at least one `[permissions].network` host |
+| `allow_oauth` | Manifest declares at least one `[[oauth]]` profile |
+| `allow_provider_auth` | Manifest declares `provider-ids` AND at least one network host (an injected credential needs somewhere to go) |
+| `allow_self_auth` | The installed release's recorded `signing_key_id` is the first-party key (gates e.g. `mimo`'s own bootstrap-JWT header) |
+
+The host-injected-credential guarantee: `capabilities::settings` returns an
+EMPTY value for a secret field, and `capabilities::http`
+(`AllowedHttpClient`) strips any component-supplied `Authorization`/
+`x-api-key` header before adding the host's own — a component can request a
+credentialed call but can never read, forge, or exfiltrate the credential
+itself. Two host-mediated injection capabilities cover this:
+`ryuzi:oauth/oauth` (an OAuth *profile*'s bearer token —
+`capabilities/oauth.rs`) and `ryuzi:provider-auth/provider-auth` (the user's
+stored LLM-provider API key, scoped to the bundle's own declared
+`provider-ids` — `capabilities/provider_auth.rs`, Task 16c1). Neither ever
+hands the component the raw secret.
+
+### OAuth profiles
+
+A bundle's `[[oauth]]` table (`ryuzi_plugin_sdk::bundle::OAuthProfile`: `id`,
+`authorize-url`, `token-url`, `scopes`, `client-id-setting`,
+`client-secret-setting`, `resource`, `dynamic-registration`) is a second,
+independent OAuth model from the declarative `[auth]` table documented
+[above](#auth-kinds-and-substitution) — a different Rust type, different
+store tables (`plugin_oauth_profile_tokens`/`plugin_oauth_profile_clients`,
+keyed by `(plugin_id, profile_id)`, vs. the single-token-per-plugin
+`plugin_oauth_token`), and a profile id distinct from the plugin id (so one
+bundle can hold more than one profile). The component never drives the
+flow: it only ever calls `authorized-request(profile_id, ...)` /
+`disconnect(profile_id)`; PKCE, device flow, refresh, and token storage all
+live host-side in `plugins::capabilities::oauth::ProfileOauth`, exposed as
+four RPCs (`plugin_profile_begin_pkce`, `plugin_profile_disconnect`,
+`plugin_profile_begin_device_flow`, `plugin_profile_poll_device_flow`) —
+none of which Cockpit's UI calls yet, so connecting a component's OAuth
+profile today is an API-level operation, not a Cockpit button.
+
+`github`'s bundle declares one `github` profile; `bitbucket`'s declares
+`bitbucket-cloud`, DELIBERATELY isolated from `atlassian`'s
+`atlassian-cloud` profile — Bitbucket Cloud's OAuth consumer is a separate
+app registration from Atlassian's Jira/Confluence 3LO app, and the two
+grants share no token (`plugins/bitbucket/ryuzi-plugin.toml`'s own comment
+on this).
+
+### Revocation & recovery
+
+Two independent revoke surfaces exist, at two different layers:
+
+- The [remote catalog](#the-blocked-denylist)'s `blocked` denylist revokes a
+  declarative catalog id.
+- The **component-release ledger**'s per-version `revoked` flag
+  (`mark_component_release_revoked`, driven by the
+  `rollback_component_plugin` RPC) revokes one installed WASM bundle
+  release.
+
+`rollback_component_plugin` reactivates the prior-good version FIRST
+(`set_active_component_release`, which itself validates the target exists
+and is not already revoked) and only THEN revokes the bad one — so a
+rollback whose target is missing or already revoked is a clean no-op that
+leaves the bad version active, rather than ever stranding the plugin with no
+active release (verified by
+`rollback_is_a_no_op_when_target_version_is_missing`/
+`rollback_is_a_no_op_when_target_version_is_revoked` in
+`crates/core/src/api/plugins_api.rs`). A blocked/revoked declarative-catalog
+id can never be (re-)enabled going forward — `toggle_enabled`'s `is_blocked`
+check refuses the flip outright. For anything already running when a
+revoke lands, `apply_blocked_denylist` + `stop_revoked_gateways` gracefully
+stop a currently-supervised WASM gateway (calling its own existing
+`Gateway::stop`) at a safe boundary, mid-session, rather than waiting for
+the next restart; a connector or provider component (never long-lived,
+re-resolved every session-attach/daemon-boot) simply picks up the change on
+its next attach via the `plugins_restart_required` flag. Every recorded
+revoke reason (`revocation_reason`) is operator-authored, secret-free text,
+never a raw error or credential.
+
+### Doctor: WASM-component diagnostics
+
+`plugin_doctor` (Task 17b) adds seven new `kind`s on top of the ones
+[already documented](#attach-status-and-doctor), all read-only and iterated
+generically over the component-release ledger — no plugin-id branch:
+
+| `kind` | Severity | Trigger |
+| --- | --- | --- |
+| `signature-invalid` | error | The active release's bundle no longer verifies against a trusted key (untrusted `signing_key_id`, or a `verify_bundle` failure) |
+| `hash-mismatch` | error | The on-disk `.wasm`'s SHA-256 no longer matches the ledger's recorded checksum (tamper/corruption) |
+| `abi-incompatible` | error | The release's `wit-api` range excludes this host's compiled WIT contract version |
+| `revoked` | error | A ledger release is recorded `revoked` (independent of the signed-feed `blocked` finding) |
+| `policy-violation` | error/warn | The installed manifest fails `PluginBundleManifest::validate()` (error), or declares `provider-ids` without a network allowlist so the host cannot grant `allow_provider_auth` (warn) |
+| `oauth-profile-unhealthy` | warn | A declared `[[oauth]]` profile's stored token is missing, reconnect-flagged, or expired |
+| `gateway-restart-exhausted` | error | A supervised WASM gateway is down and has already hit its restart backoff ceiling |
+
+Every message/suggested action is generic and secret-free, matching the
+existing doctor findings' contract.
 
 ---
 

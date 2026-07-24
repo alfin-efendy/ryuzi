@@ -1,0 +1,60 @@
+id = "qwen"
+name = "Qwen Code"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "qwen.wasm"
+publisher = "Ryuzi"
+description = "Qwen Code chat provider. Talks to portal.qwen.ai/v1 with the user's Qwen subscription, which the host injects through ryuzi:oauth as the Authorization bearer — the component never sees an access or refresh token."
+
+# The LLM-router provider id(s) this bundle backs. Declaring it EXPLICITLY is
+# what registers the provider transport under the `qwen` router id and maps the
+# bundle to it. Egress is host-managed OAuth (below), NOT ryuzi:provider-auth —
+# the world imports ryuzi:oauth, not ryuzi:provider-auth, so even though
+# provider-ids alongside a network host would grant provider-auth in policy,
+# this component never imports (and so never links) that capability.
+provider-ids = ["qwen"]
+
+# The only hosts the component may reach through the host-mediated OAuth egress
+# (`ryuzi:oauth/oauth`'s `authorized-request`, bounded to this same allowlist and
+# re-checked on every redirect hop). `portal.qwen.ai` carries the
+# `/chat/completions` API call (the descriptor's base_url host); `chat.qwen.ai`
+# is where the device-authorization grant lives — both the device-code endpoint
+# (`https://chat.qwen.ai/api/v1/oauth2/device/code`) and the token endpoint
+# (`https://chat.qwen.ai/api/v1/oauth2/token`) of QWEN_DEVICE_GRANT. The
+# component itself never calls chat.qwen.ai (the host/Cockpit drives the grant),
+# but the profile below authenticates against it. This mirrors how the
+# anthropic-oauth bundle lists both its API host and its OAuth host.
+#
+# NOTE: Qwen tokens can be bound to a per-shard `resource_url` returned at grant
+# time (e.g. dashscope.aliyuncs.com); the native router rewrites the chat base to
+# that host. A component cannot read the connection's `provider_specific`, so it
+# always targets portal.qwen.ai — a token issued on another shard would 401.
+# That shard host is deliberately NOT allowlisted here: this bundle carries only
+# the descriptor-derived hosts, and the shard limitation is documented in
+# src/logic.rs.
+[permissions]
+network = ["portal.qwen.ai", "chat.qwen.ai"]
+
+# Host-managed OAuth profile, transcribed from the `qwen` ProviderDescriptor's
+# QWEN_DEVICE_GRANT (crates/core/src/llm_router/registry.rs). The component only
+# ever calls `authorized-request("qwen", ..)`; it never drives the device grant
+# and never sees a token — Cockpit + the host own that (see
+# crates/core/src/plugins/capabilities/oauth.rs). The profile `id` MUST equal the
+# string the component passes to `authorized-request` (`logic::OAUTH_PROFILE`)
+# and the router provider id. Field names are kebab-case, mirroring
+# `ryuzi_plugin_sdk::OAuthProfile`.
+#
+# `token-url` and `scopes` are transcribed from QWEN_DEVICE_GRANT. The RFC 8628
+# device-authorization flow's device-code URL, its S256 PKCE, and the static
+# device-grant client id (`f0304373...`) are host-supplied at connect time —
+# `OAuthProfile` has no field for a device-code URL, PKCE, or a literal client id
+# (device endpoints are passed to the host's device flow explicitly, mirroring
+# how the github connector supplies its client id host-side). This component's
+# only OAuth call is `authorized-request`, which needs the stored token, not any
+# of those.
+[[oauth]]
+id = "qwen"
+token-url = "https://chat.qwen.ai/api/v1/oauth2/token"
+scopes = ["openid", "profile", "email", "model.completion"]
+dynamic-registration = false

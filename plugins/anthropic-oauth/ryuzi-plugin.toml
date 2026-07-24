@@ -1,0 +1,49 @@
+id = "anthropic-oauth"
+name = "Anthropic (Claude subscription)"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "anthropic-oauth.wasm"
+publisher = "Ryuzi"
+description = "Anthropic (Claude Pro/Max subscription) chat provider. Talks to api.anthropic.com with the user's Claude subscription, which the host injects through ryuzi:oauth as the Authorization bearer — the component never sees an access or refresh token."
+
+# The LLM-router provider id(s) this bundle backs. Declaring it EXPLICITLY is
+# what registers the provider transport under the `anthropic-oauth` router id and
+# maps the bundle to it. Egress is host-managed OAuth (below), NOT
+# ryuzi:provider-auth — the world imports ryuzi:oauth, not ryuzi:provider-auth,
+# so even though provider-ids alongside a network host would grant provider-auth
+# in policy, this component never imports (and so never links) that capability.
+provider-ids = ["anthropic-oauth"]
+
+# The only hosts the component may reach through the host-mediated OAuth egress
+# (`ryuzi:oauth/oauth`'s `authorized-request`, which is bounded to this same
+# allowlist and re-checked on every redirect hop). `api.anthropic.com` carries
+# every `/models` + `/messages` API call AND the OAuth token endpoint
+# (`https://api.anthropic.com/v1/oauth/token`); `claude.ai` is where the
+# host-driven OAuth authorize step lives
+# (`https://claude.ai/oauth/authorize`) — the component itself never calls
+# claude.ai, but the profile below authorizes against it. This mirrors how the
+# github connector lists both `api.github.com` and `github.com`.
+[permissions]
+network = ["api.anthropic.com", "claude.ai"]
+
+# Host-managed OAuth profile, transcribed from the `anthropic-oauth`
+# ProviderDescriptor's OAuthConfig
+# (crates/core/src/llm_router/registry.rs). The component only ever calls
+# `authorized-request("anthropic-oauth", ..)`; it never drives PKCE and never
+# sees a token — Cockpit + the host own that (see
+# crates/core/src/plugins/capabilities/oauth.rs). The profile `id` MUST equal
+# the string the component passes to `authorized-request`
+# (`logic::OAUTH_PROFILE`) and the router provider id. Field names are
+# kebab-case, mirroring `ryuzi_plugin_sdk::OAuthProfile`.
+[[oauth]]
+id = "anthropic-oauth"
+authorize-url = "https://claude.ai/oauth/authorize"
+token-url = "https://api.anthropic.com/v1/oauth/token"
+scopes = ["org:create_api_key", "user:profile", "user:inference"]
+# The descriptor's fixed public client id
+# (`9d1c250a-e61b-44d9-88ed-5944d1962f5e`) is supplied host-side at connect time,
+# not via a plugin setting; `OAuthProfile` holds no literal client id (mirroring
+# the github connector). This component's only OAuth call is
+# `authorized-request`, which needs the stored token, not the client id.
+dynamic-registration = false

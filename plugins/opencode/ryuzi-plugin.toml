@@ -7,6 +7,12 @@ component = "opencode.wasm"
 publisher = "Ryuzi"
 description = "OpenCode Zen free-tier chat provider. Talks to opencode.ai/zen/v1 with the static `Bearer public` token and the x-opencode-client header."
 
+# The LLM-router provider id(s) this bundle backs. The bundle id is `opencode`,
+# but free-tier routing resolves to the `opencode-free` provider (see the
+# bootstrap provider seeding + free-route families), so the host registers this
+# component's transport under `opencode-free`.
+provider-ids = ["opencode-free"]
+
 # Only host the component may reach through `ryuzi:http/http`. Covers both the
 # /models and /chat/completions endpoints under opencode.ai/zen/v1.
 [permissions]

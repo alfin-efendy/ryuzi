@@ -1,0 +1,39 @@
+[workspace]
+
+[package]
+name = "ryuzi-plugin-mistral"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "First-party Mistral provider component (ryuzi:provider/provider, authenticated through ryuzi:provider-auth)."
+
+[lib]
+crate-type = ["cdylib"]
+
+# `wit-bindgen` is only invoked inside the `#[cfg(target_arch = "wasm32")]`
+# guest module (by `ryuzi_openai_format::provider_component!`, which expands
+# `wit_bindgen::generate!` HERE so `path: "wit"` resolves against this crate's
+# manifest dir); the pure config module and its native `cargo test` never touch
+# the generated host bindings.
+#
+# `ryuzi-openai-format` is a path dependency on a sibling standalone workspace —
+# the mechanism for sharing code across the independently buildable
+# `plugins/<id>/` bundles.
+[dependencies]
+wit-bindgen = "0.57"
+ryuzi-openai-format = { path = "../openai-format" }
+
+# `serde_json` is TEST-ONLY here. Every wire body this component sends or parses
+# is built by `ryuzi-openai-format`; the only code in this crate that touches
+# JSON is `logic`'s own tests, which re-parse what the shared crate produced.
+# Keeping it out of `[dependencies]` drops a whole crate from the wasm build.
+[dev-dependencies]
+serde_json = "1"
+
+[profile.release]
+# Small, reproducible components: no debug info, abort on panic (a panicking
+# guest is caught by the host fuel/epoch budget as a trap either way).
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

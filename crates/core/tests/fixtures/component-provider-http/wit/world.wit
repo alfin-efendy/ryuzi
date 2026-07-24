@@ -1,0 +1,8 @@
+package fixture:provider-http@0.1.0;
+
+world provider-http-fixture {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:http/http@0.1.0;
+  import ryuzi:storage/storage@0.1.0;
+  export ryuzi:provider/provider@0.1.0;
+}

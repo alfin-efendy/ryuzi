@@ -69,6 +69,30 @@ export interface ComponentSpec {
 export const COMPONENTS: ComponentSpec[] = [
   { id: "mimo", dir: "plugins/mimo", crateWasmStem: "ryuzi_plugin_mimo" },
   { id: "opencode", dir: "plugins/opencode", crateWasmStem: "ryuzi_plugin_opencode" },
+  // OpenAI-chat provider components. All share the `plugins/openai-format`
+  // crate (which is NOT a bundle and so is not listed here — it has no manifest
+  // and produces no .wasm; it is pulled in as a path dependency of each).
+  { id: "openai", dir: "plugins/openai", crateWasmStem: "ryuzi_plugin_openai" },
+  { id: "openrouter", dir: "plugins/openrouter", crateWasmStem: "ryuzi_plugin_openrouter" },
+  { id: "groq", dir: "plugins/groq", crateWasmStem: "ryuzi_plugin_groq" },
+  { id: "deepseek", dir: "plugins/deepseek", crateWasmStem: "ryuzi_plugin_deepseek" },
+  { id: "mistral", dir: "plugins/mistral", crateWasmStem: "ryuzi_plugin_mistral" },
+  { id: "xai", dir: "plugins/xai", crateWasmStem: "ryuzi_plugin_xai" },
+  { id: "nvidia", dir: "plugins/nvidia", crateWasmStem: "ryuzi_plugin_nvidia" },
+  { id: "huggingface", dir: "plugins/huggingface", crateWasmStem: "ryuzi_plugin_huggingface" },
+  { id: "google", dir: "plugins/google", crateWasmStem: "ryuzi_plugin_google" },
+  // Qwen also speaks OpenAI-chat (shares `plugins/openai-format`); its egress is
+  // host-managed OAuth (the world imports `ryuzi:oauth`, not provider-auth), but
+  // it builds and signs exactly like the other OpenAI-chat components.
+  { id: "qwen", dir: "plugins/qwen", crateWasmStem: "ryuzi_plugin_qwen" },
+  // Anthropic speaks the Messages wire format, not OpenAI-chat, so its bundle
+  // does NOT depend on `plugins/openai-format`; it is built identically all the
+  // same.
+  { id: "anthropic", dir: "plugins/anthropic", crateWasmStem: "ryuzi_plugin_anthropic" },
+  // Anthropic-OAuth speaks the same Messages wire format (shares
+  // `plugins/anthropic-format`); its egress is host-managed OAuth rather than an
+  // API key, but it builds and signs identically.
+  { id: "anthropic-oauth", dir: "plugins/anthropic-oauth", crateWasmStem: "ryuzi_plugin_anthropic_oauth" },
   { id: "github", dir: "plugins/github", crateWasmStem: "ryuzi_plugin_github" },
   { id: "discord", dir: "plugins/discord", crateWasmStem: "ryuzi_plugin_discord" },
   { id: "atlassian", dir: "plugins/atlassian", crateWasmStem: "ryuzi_plugin_atlassian" },

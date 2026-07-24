@@ -1788,6 +1788,13 @@ async fn rollback_component_plugin(
         )
         .await?;
     cp.mark_plugins_restart_required();
+    // If the rolled-back plugin is a currently-running gateway, stop its
+    // supervisor MID-SESSION at a safe boundary — the restart flag above only
+    // reloads the (now good) bundle on the NEXT boot, so the revoked one would
+    // otherwise keep running until then. Keyed by plugin id; a no-op for a
+    // connector/provider or a gateway not presently supervised.
+    cp.stop_revoked_running_gateways(&std::iter::once(plugin_id.to_string()).collect())
+        .await;
     plugin_release_detail(cp, plugin_id).await
 }
 
@@ -1878,6 +1885,7 @@ async fn profile_capability_context(
             .map(|entry| entry.0.clone())
             .collect(),
         oauth_profile_ids: manifest.oauth.iter().map(|p| p.id.clone()).collect(),
+        provider_ids: manifest.resolved_provider_ids(),
     };
     Ok((ctx, manifest))
 }

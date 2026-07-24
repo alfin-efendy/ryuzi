@@ -539,6 +539,7 @@ mod tests {
             telemetry: Arc::new(NoopTelemetry),
             network_allowlist: vec![],
             oauth_profile_ids: vec![],
+            provider_ids: vec![],
         });
         let bundle = InstalledBundle {
             manifest: PluginBundleManifest {
@@ -552,6 +553,7 @@ mod tests {
                 description: String::new(),
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
+                provider_ids: vec![],
             },
             release: PluginRelease {
                 id: plugin_id.to_string(),

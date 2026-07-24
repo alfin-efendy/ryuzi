@@ -12,7 +12,7 @@ use crate::settings::SettingsStore;
 use crate::store::Store;
 use crate::telemetry::{NoopTelemetry, Telemetry};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::broadcast;
 
 mod app_control;
@@ -165,6 +165,15 @@ pub struct ControlPlane {
     /// `ControlPlane` in a process enforces stable, deterministic quotas —
     /// see [`Self::new_full`].
     artifacts: Arc<crate::artifacts::ArtifactService>,
+    /// The daemon's live gateways, registered by `build_daemon` via
+    /// [`Self::register_gateways`] once they are built. Held as `Weak` so this
+    /// control plane never keeps a gateway alive past daemon shutdown (the
+    /// daemon owns the strong `Arc`s; a `Router` also holds strong clones).
+    /// Its sole purpose is to let the revocation entry points — which hold only
+    /// an `Arc<ControlPlane>`, never the gateways — reach a running gateway
+    /// supervisor BY ID to stop it at a safe boundary
+    /// ([`Self::stop_revoked_running_gateways`]).
+    live_gateways: Mutex<Vec<Weak<dyn crate::gateway::Gateway>>>,
 }
 
 impl ControlPlane {
@@ -291,7 +300,59 @@ impl ControlPlane {
             extension_host: Arc::new(ExtensionHost::new()),
             agent_persistence: persistence.handles(),
             artifacts,
+            live_gateways: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Register the daemon's live gateways so the revocation entry points can
+    /// later reach a running gateway supervisor by id and stop it at a safe
+    /// boundary. Called once by `build_daemon` after the gateways are built.
+    /// Stores `Weak` handles (see the `live_gateways` field doc) — a fresh
+    /// registration replaces any prior set, so a rebuilt daemon never leaks
+    /// stale handles.
+    pub fn register_gateways(&self, gateways: &[Arc<dyn crate::gateway::Gateway>]) {
+        let weak = gateways.iter().map(Arc::downgrade).collect();
+        *self.live_gateways.lock().unwrap() = weak;
+    }
+
+    /// Gracefully stop every currently-running registered gateway whose id is in
+    /// `revoked_ids`, returning the ids actually stopped. This is the
+    /// control-plane accessor the revocation entry points (signed-feed
+    /// blocklist sweep, component-release rollback) call so a revoked gateway is
+    /// disabled MID-SESSION at a safe boundary rather than only on the next
+    /// daemon restart. Generic + resilient: it delegates entirely to
+    /// [`crate::plugins::stop_revoked_gateways`] (matches on `Gateway::id`, no
+    /// plugin-id branch; a revoked id with no running gateway is a clean no-op;
+    /// a stop that errors is swallowed). Dropped `Weak`s (a gateway already gone)
+    /// are skipped.
+    pub async fn stop_revoked_running_gateways(
+        &self,
+        revoked_ids: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let live: Vec<Arc<dyn crate::gateway::Gateway>> = {
+            let guard = self.live_gateways.lock().unwrap();
+            guard.iter().filter_map(Weak::upgrade).collect()
+        };
+        crate::plugins::stop_revoked_gateways(&live, revoked_ids).await
+    }
+
+    /// The restart budget health of every currently-running registered gateway
+    /// that has one (`(gateway_id, health)` pairs). Read by `plugin_doctor` to
+    /// surface a long-lived WASM gateway stuck restarting. Native gateways
+    /// report no restart health and are skipped; dropped `Weak`s (a gateway
+    /// already gone) are skipped. Generic: no plugin-id branch — it delegates
+    /// entirely to [`crate::gateway::Gateway::restart_health`].
+    pub fn gateway_restart_health(&self) -> Vec<(String, crate::gateway::GatewayRestartHealth)> {
+        let guard = self.live_gateways.lock().unwrap();
+        guard
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter_map(|gateway| {
+                gateway
+                    .restart_health()
+                    .map(|health| (gateway.id().to_string(), health))
+            })
+            .collect()
     }
 
     /// One-time, best-effort startup maintenance for the install ledger and

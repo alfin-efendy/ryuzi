@@ -32,6 +32,19 @@ impl GatewayStatus {
     }
 }
 
+/// The restart budget health of a self-supervised, long-lived gateway (the
+/// WASM gateway bridge). `running` is whether the component last reported
+/// itself up; `restart_count` is how many times its supervisor has restarted
+/// it after a trap. `plugin_doctor` reads this (via [`Gateway::restart_health`])
+/// to surface a gateway stuck restarting — see that module's
+/// `gateway-restart-exhausted` finding. Native gateways (no independently
+/// supervised restart budget) report `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayRestartHealth {
+    pub running: bool,
+    pub restart_count: u32,
+}
+
 /// Number of status transitions retained for a subscriber that is briefly
 /// delayed. This is deliberately bounded: a sustained flapping gateway is
 /// backpressured by the daemon's bounded delivery queue rather than creating
@@ -152,6 +165,15 @@ pub trait Gateway: Send + Sync {
     /// Subscribe to operational connection changes. Gateways without an
     /// independently observed runtime status retain the default no-op.
     fn subscribe_status(&self) -> Option<GatewayStatusSubscription> {
+        None
+    }
+
+    /// The restart budget health of a self-supervised, long-lived gateway, if
+    /// this gateway has one. Read by `plugin_doctor` to report a gateway whose
+    /// supervisor is stuck restarting it. Default `None`: native gateways have
+    /// no independently supervised restart budget, so they never surface a
+    /// restart-exhaustion finding. Only the WASM gateway bridge overrides it.
+    fn restart_health(&self) -> Option<GatewayRestartHealth> {
         None
     }
 }

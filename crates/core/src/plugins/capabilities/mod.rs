@@ -17,6 +17,11 @@
 //! - [`oauth`] — host-side OAuth profile logic (Task 8 slice 2a): builds PKCE
 //!   authorize URLs and injects a stored bearer token into outbound
 //!   requests, but never hands the raw access/refresh token to a component.
+//! - [`provider_auth`] — `ryuzi:provider-auth/provider-auth@0.1.0` (Task
+//!   16c1): the API-key analogue of [`oauth`]. Injects the USER's stored
+//!   provider credential into an outbound request according to the provider
+//!   descriptor's declared auth scheme, for a provider id the bundle's manifest
+//!   declares — the component never receives the key.
 //! - [`websocket`] — `ryuzi:websocket/websocket@0.1.0`: a host-owned TLS
 //!   WebSocket the component drives (connect/send/poll/state/close). Owns the
 //!   raw `tokio-tungstenite` socket per instance, enforces the `wss`-only +
@@ -31,6 +36,7 @@
 pub mod host;
 pub mod http;
 pub mod oauth;
+pub mod provider_auth;
 pub mod settings;
 pub mod storage;
 pub mod websocket;
@@ -59,6 +65,20 @@ pub struct PluginCapabilityContext {
     /// OAuth profile IDs declared by the installed bundle. This prevents a
     /// component from selecting an undeclared same-plugin profile.
     pub oauth_profile_ids: Vec<String>,
+    /// LLM-router provider ids the installed bundle declares it serves. This
+    /// is the ONLY set of providers whose stored user API key
+    /// [`provider_auth::ProviderAuth`] will inject on this bundle's behalf —
+    /// it prevents a component from borrowing another provider's credential.
+    ///
+    /// For a guest-reachable context this is the EXPLICIT manifest
+    /// `provider-ids` (`ComponentRuntime::compile`), the same field
+    /// `HostPolicy::allow_provider_auth` gates the capability grant on, so one
+    /// rule governs both. Host-internal call sites that only need transport
+    /// registration may seed it from
+    /// `PluginBundleManifest::resolved_provider_ids` (which falls back to the
+    /// bundle id); that never widens a credential grant, because with no
+    /// declared `provider-ids` the capability is not linked at all.
+    pub provider_ids: Vec<String>,
 }
 
 /// Case-insensitive substrings that mark a field *name* as secret-shaped —
