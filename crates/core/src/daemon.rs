@@ -591,6 +591,13 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         gateways.push(gw as Arc<dyn Gateway>);
     }
 
+    // Register the live gateways with the control plane so the revocation entry
+    // points (signed-feed blocklist sweep, component-release rollback) — which
+    // hold only an `Arc<ControlPlane>` — can reach a running gateway supervisor
+    // by id and stop it MID-SESSION at a safe boundary. The `ControlPlane` keeps
+    // only `Weak` handles, so this never keeps a gateway alive past shutdown.
+    cp.register_gateways(&gateways);
+
     // Activate any enabled, installed provider component bundle (design §5.5 /
     // plan Task 16): register a live WASM provider transport under each router
     // provider id its manifest declares (e.g. the `mimo` bundle backs

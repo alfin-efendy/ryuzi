@@ -59,7 +59,15 @@ async fn refresh_catalog(cp: &ControlPlane) -> anyhow::Result<CatalogStatus> {
         if after != before {
             cp.mark_plugins_restart_required();
         }
-        let _ = crate::plugins::apply_blocked_denylist(cp.store(), &settings, cp.plugins()).await;
+        if let Ok(blocked) =
+            crate::plugins::apply_blocked_denylist(cp.store(), &settings, cp.plugins()).await
+        {
+            // Live-stop any running gateway among the just-blocked ids at a safe
+            // boundary, matching the background `RemoteCatalogManager` path — a
+            // manual "fetch now" must disable a revoked gateway the same way.
+            cp.stop_revoked_running_gateways(&blocked.into_iter().collect())
+                .await;
+        }
     }
     catalog_status(cp).await
 }

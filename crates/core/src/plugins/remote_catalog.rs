@@ -419,12 +419,20 @@ impl RemoteCatalogManager {
             if after != before {
                 self.cp.mark_plugins_restart_required();
             }
-            let _ = crate::plugins::apply_blocked_denylist(
+            if let Ok(blocked) = crate::plugins::apply_blocked_denylist(
                 &self.store,
                 &self.settings,
                 self.cp.plugins(),
             )
-            .await;
+            .await
+            {
+                // Live-stop any running gateway among the just-blocked ids at a
+                // safe boundary — the enable-flag flip above alone would leave a
+                // revoked, actively-running gateway up until the next restart.
+                self.cp
+                    .stop_revoked_running_gateways(&blocked.into_iter().collect())
+                    .await;
+            }
         }
         outcome
     }

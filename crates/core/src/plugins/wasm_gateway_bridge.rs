@@ -574,6 +574,14 @@ impl WasmGateway {
         self.tasks.iter().map(|task| task.abort_handle()).collect()
     }
 
+    /// Test-only: the supervisor's live `running` flag, so a revocation test can
+    /// assert the GRACEFUL stop actually took effect (running -> false) after
+    /// the id was revoked — not merely that `stop()` was invoked.
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        self.supervisor.status().running
+    }
+
     /// Encode and hand `op` to the component. `Ok(())` means the component
     /// accepted the delivery (its `op.result`/`approval.decision`, if any, then
     /// arrives via `poll-inbound`); `Err` means the supervisor is
@@ -1893,6 +1901,59 @@ mod gateway_impl_tests {
         .await
         .expect("status must reach Connected within the deadline");
         assert!(connected, "gateway must report Connected");
+    }
+
+    /// The revocation gap-closer, proven end-to-end at lib level against a REAL
+    /// running WASM gateway supervisor: revoking the gateway's id through the
+    /// generic `stop_revoked_gateways` mechanism (the same call the
+    /// control-plane accessor delegates to) gracefully stops it at a safe
+    /// boundary. Asserts the stop took REAL effect — the supervisor's `running`
+    /// flag goes false — not merely that `stop()` was invoked. A revoked id
+    /// naming no running gateway is a clean no-op alongside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revocation_gracefully_stops_a_running_wasm_gateway_by_id() {
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+        let gateway = Arc::new(gateway);
+
+        // The supervisor starts the component on spawn; wait until it reports
+        // running so the stop below exercises a genuinely-active gateway.
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if gateway.is_running() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the gateway must start within the deadline");
+        assert!(
+            started,
+            "the gateway supervisor must report running before revocation"
+        );
+
+        // Revoke it (plus a "ghost" id that names no running gateway) through
+        // the generic mechanism.
+        let gateways: Vec<Arc<dyn Gateway>> = vec![gateway.clone() as Arc<dyn Gateway>];
+        let revoked: std::collections::HashSet<String> =
+            ["acme-gateway".to_string(), "ghost".to_string()]
+                .into_iter()
+                .collect();
+        let stopped = crate::plugins::stop_revoked_gateways(&gateways, &revoked).await;
+
+        assert_eq!(
+            stopped,
+            vec!["acme-gateway".to_string()],
+            "only the running revoked gateway is reported stopped ('ghost' is a no-op)"
+        );
+        assert!(
+            !gateway.is_running(),
+            "the revoked gateway's supervisor must be gracefully stopped (running=false)"
+        );
     }
 
     // -------------------------------------------------------------
