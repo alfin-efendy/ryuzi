@@ -22,4 +22,14 @@ runs:
     - if: inputs.cache == 'true'
       uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
+        # Only the root workspace's `target` is cached. The first-party plugin
+        # components under `plugins/<id>/` are standalone workspaces the
+        # ryuzi-core conformance/e2e tests build into per-plugin `target/` dirs,
+        # so those component builds cold-compile each run. They are intentionally
+        # NOT cached: rust-cache resolves each `workspaces` root literally (no
+        # globs — `plugins/*` cannot work), and those workspaces ship no committed
+        # Cargo.lock, so their dep graph floats between runs — exactly the
+        # stale-restore case that produced E0463 here before (see the `cache`
+        # input note above). Revisit only with committed lockfiles + explicit
+        # per-dir entries.
         workspaces: ". -> target"

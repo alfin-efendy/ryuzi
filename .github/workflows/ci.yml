@@ -113,6 +113,16 @@ jobs:
       - name: cargo test
         run: cargo test -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk
         timeout-minutes: 20
+      # The shared provider wire-logic crates are standalone workspaces, not
+      # members of the root workspace, so the `-p ryuzi-core ...` run above never
+      # executes their `#[cfg(test)]` unit tests — only the ryuzi-core
+      # conformance batteries exercise them end-to-end through a built component.
+      # Run their native unit tests directly (tiny host-target rlibs, no wasm) so
+      # the request/response/error wire mapping is covered by its own fast tests.
+      - name: cargo test — shared provider wire-logic crates
+        run: |
+          cargo test --manifest-path plugins/openai-format/Cargo.toml
+          cargo test --manifest-path plugins/anthropic-format/Cargo.toml
       - name: Build + smoke the runner binary (absorbs the old build-smoke job)
         run: |
           cargo build -p ryuzi-runner

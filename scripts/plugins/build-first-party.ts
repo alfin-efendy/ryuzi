@@ -81,10 +81,18 @@ export const COMPONENTS: ComponentSpec[] = [
   { id: "nvidia", dir: "plugins/nvidia", crateWasmStem: "ryuzi_plugin_nvidia" },
   { id: "huggingface", dir: "plugins/huggingface", crateWasmStem: "ryuzi_plugin_huggingface" },
   { id: "google", dir: "plugins/google", crateWasmStem: "ryuzi_plugin_google" },
+  // Qwen also speaks OpenAI-chat (shares `plugins/openai-format`); its egress is
+  // host-managed OAuth (the world imports `ryuzi:oauth`, not provider-auth), but
+  // it builds and signs exactly like the other OpenAI-chat components.
+  { id: "qwen", dir: "plugins/qwen", crateWasmStem: "ryuzi_plugin_qwen" },
   // Anthropic speaks the Messages wire format, not OpenAI-chat, so its bundle
   // does NOT depend on `plugins/openai-format`; it is built identically all the
   // same.
   { id: "anthropic", dir: "plugins/anthropic", crateWasmStem: "ryuzi_plugin_anthropic" },
+  // Anthropic-OAuth speaks the same Messages wire format (shares
+  // `plugins/anthropic-format`); its egress is host-managed OAuth rather than an
+  // API key, but it builds and signs identically.
+  { id: "anthropic-oauth", dir: "plugins/anthropic-oauth", crateWasmStem: "ryuzi_plugin_anthropic_oauth" },
   { id: "github", dir: "plugins/github", crateWasmStem: "ryuzi_plugin_github" },
   { id: "discord", dir: "plugins/discord", crateWasmStem: "ryuzi_plugin_discord" },
   { id: "atlassian", dir: "plugins/atlassian", crateWasmStem: "ryuzi_plugin_atlassian" },
