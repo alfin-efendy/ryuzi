@@ -47,8 +47,8 @@ pub use ryuzi_core::api::types::{
     CatalogStatus, ComponentBootstrapStatus, ComponentManifestInfo, ComponentOauthProfileInfo,
     ComponentReleaseDetail, ComponentReleaseInfo, DoctorFinding, ExtensionStatusEntry,
     PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo, PluginInstallBeginResult,
-    PluginMcpInfo, PluginOauthBeginResult, SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto,
-    UpdateOutcomeEntry,
+    PluginMcpInfo, PluginOauthBeginResult, PluginProfileDeviceFlowStart, SkillInstallBegin,
+    TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -173,6 +173,79 @@ pub async fn plugin_models(
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc("plugin_models", serde_json::json!({ "id": id }))
+        .await
+}
+
+// ---------- Component OAuth profile device-flow connect (Task: component OAuth UI) ----------
+//
+// The device grant (RFC 8628) is the only flow that completes for a component's
+// `[[oauth]]` profile — begin returns a user code + verification URL, then the
+// UI polls until a token is stored. `device_authorization_url`/`token_url` come
+// off the profile (`ComponentOauthProfileInfo`), so Cockpit forwards what the
+// manifest declared rather than hardcoding a provider's endpoints.
+
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_profile_begin_device_flow(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    plugin_id: String,
+    profile_id: String,
+    device_authorization_url: String,
+) -> R<PluginProfileDeviceFlowStart> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "plugin_profile_begin_device_flow",
+            serde_json::json!({
+                "plugin_id": plugin_id,
+                "profile_id": profile_id,
+                "device_authorization_url": device_authorization_url,
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_profile_poll_device_flow(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    plugin_id: String,
+    profile_id: String,
+    token_url: String,
+    device_code: String,
+    expires_at: i64,
+) -> R<String> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "plugin_profile_poll_device_flow",
+            serde_json::json!({
+                "plugin_id": plugin_id,
+                "profile_id": profile_id,
+                "token_url": token_url,
+                "device_code": device_code,
+                "expires_at": expires_at,
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_profile_disconnect(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    plugin_id: String,
+    profile_id: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "plugin_profile_disconnect",
+            serde_json::json!({ "plugin_id": plugin_id, "profile_id": profile_id }),
+        )
         .await
 }
 

@@ -7,6 +7,7 @@ import {
   type ComponentReleaseDetail,
   type DoctorFinding,
   type PluginInfo,
+  type PluginProfileDeviceFlowStart,
 } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
@@ -59,6 +60,22 @@ type PluginsState = {
   pluginReleaseDetail: (id: string) => Promise<ComponentReleaseDetail | null>;
   installComponentPlugin: (id: string, version?: string) => Promise<ComponentReleaseDetail | null>;
   rollbackComponentPlugin: (id: string, fromVersion: string, toVersion: string) => Promise<ComponentReleaseDetail | null>;
+  /** Component OAuth profile device-flow connect. Thin RPC wrappers — the
+   *  poll loop + code display live in the view (`PluginDetailView`), which owns
+   *  the transient flow state. All toast on error. */
+  beginProfileDeviceFlow: (
+    pluginId: string,
+    profileId: string,
+    deviceAuthorizationUrl: string,
+  ) => Promise<PluginProfileDeviceFlowStart | null>;
+  pollProfileDeviceFlow: (
+    pluginId: string,
+    profileId: string,
+    tokenUrl: string,
+    deviceCode: string,
+    expiresAt: number,
+  ) => Promise<string | null>;
+  disconnectProfile: (pluginId: string, profileId: string) => Promise<boolean>;
   /** Manually retries the first-party bootstrap (which otherwise only runs
    *  automatically at daemon start): attempts `installComponentPlugin` for
    *  every known first-party id, then reloads the bootstrap status and the
@@ -241,6 +258,34 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     toast.success(`Rolled back ${id} to v${toVersion}`);
     await get().loadComponentPlugins();
     return res.data;
+  },
+
+  beginProfileDeviceFlow: async (pluginId, profileId, deviceAuthorizationUrl) => {
+    const res = await commands.pluginProfileBeginDeviceFlow("local", pluginId, profileId, deviceAuthorizationUrl);
+    if (res.status === "error") {
+      toast.error(`Couldn't start the connection: ${res.error.message}`);
+      return null;
+    }
+    return res.data;
+  },
+
+  pollProfileDeviceFlow: async (pluginId, profileId, tokenUrl, deviceCode, expiresAt) => {
+    const res = await commands.pluginProfilePollDeviceFlow("local", pluginId, profileId, tokenUrl, deviceCode, expiresAt);
+    // A poll RPC error is usually a transient network blip on the fresh
+    // connection this poll opens — the caller's loop tolerates a few of these
+    // and keeps polling, so DON'T toast here (that would spam every retry).
+    if (res.status === "error") return null;
+    return res.data;
+  },
+
+  disconnectProfile: async (pluginId, profileId) => {
+    const res = await commands.pluginProfileDisconnect("local", pluginId, profileId);
+    if (res.status === "error") {
+      toast.error(`Disconnect failed: ${res.error.message}`);
+      return false;
+    }
+    toast.success("Disconnected");
+    return true;
   },
 
   retryComponentBootstrap: async () => {

@@ -313,6 +313,8 @@ impl PluginHost {
     /// - harness-capable → always `true` (the native runtime cannot be
     ///   disabled)
     /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
+    /// - component bundle → the setting `plugin.<id>.enabled == "true"`
+    ///   (defaults to `false`), matching `component_plugin_enabled`
     /// - experimental → always `false` (see below)
     /// - manifest-only (no harness/gateway/connector/extension capability)
     ///   → always `true`
@@ -325,6 +327,17 @@ impl PluginHost {
         if plugin.harness.is_some() {
             // The native runtime is the only harness and is always enabled.
             return Ok(true);
+        }
+        if plugin.source == PluginSource::Component {
+            // A first-party WASM component bundle is registered manifest-only
+            // (its connector/gateway/provider capability runs off-disk), but
+            // ALL of those gate on `plugin.<id>.enabled` via
+            // `component_plugin_enabled`. Report that same gate so the UI
+            // reflects the real switch instead of the manifest-only
+            // "always on" default below — and so `toggle_enabled` has a switch
+            // to flip.
+            let key = format!("plugin.{id}.enabled");
+            return Ok(settings.get(&key).await?.as_deref() == Some("true"));
         }
         if plugin.gateway.is_some() {
             let enabled = csv(settings.get("enabled_gateways").await?.as_deref());

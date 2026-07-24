@@ -1,6 +1,6 @@
 id = "github"
 name = "GitHub"
-version = "0.1.0"
+version = "0.1.1"
 wit-api = ">=0.1.0, <0.2.0"
 lifecycle = "per-call"
 component = "github.wasm"
@@ -25,12 +25,17 @@ network = ["api.github.com", "github.com"]
 id = "github"
 authorize-url = "https://github.com/login/oauth/authorize"
 token-url = "https://github.com/login/oauth/access_token"
+# The RFC 8628 device-authorization endpoint. Cockpit connects this profile via
+# the device grant (the only flow that completes for component profiles), and
+# the host's `begin_device_flow` reads this URL off the profile.
+device-authorization-url = "https://github.com/login/device/code"
 scopes = ["repo", "read:org", "user"]
-# GitHub OAuth apps do not support RFC 7591 Dynamic Client Registration; the
-# client id is provisioned out-of-band and supplied host-side at connect time.
+# GitHub OAuth apps do not support RFC 7591 Dynamic Client Registration. Instead
+# — the `gh` CLI model — this component ships a first-party PUBLIC OAuth App
+# client id so an end-user connects with zero configuration. It is public, not a
+# secret (device flow uses a public client, no client secret). A user-set
+# client-id-setting or a stored per-install client id still overrides it.
+# The Ryuzi GitHub OAuth App client id (registered with "Enable Device Flow").
+# Public identifier, not a secret.
+client-id = "Ov23lijhiwiIgxoH2VcV"
 dynamic-registration = false
-# NOTE: `OAuthProfile` has no `device-authorization-url` field — the host's
-# `begin_device_flow` receives the device-code endpoint explicitly from Cockpit
-# (see the module doc in capabilities/oauth.rs). GitHub's is recorded here for
-# the 13b host-side device-flow wiring:
-#   https://github.com/login/device/code

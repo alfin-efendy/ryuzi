@@ -1248,6 +1248,22 @@ impl From<crate::store::ComponentPluginReleaseRecord> for ComponentReleaseInfo {
 pub struct ComponentOauthProfileInfo {
     pub id: String,
     pub scopes: Vec<String>,
+    /// The profile's token endpoint (`token_url`), which the device-flow poll
+    /// exchanges the device code against. `None` when the manifest omits it.
+    pub token_url: Option<String>,
+    /// The RFC 8628 device-authorization endpoint. Present iff this profile
+    /// supports the device grant — Cockpit's Connect button only shows when it
+    /// is set.
+    pub device_authorization_url: Option<String>,
+    /// A token row exists for `(plugin_id, profile_id)` — i.e. the profile is
+    /// connected. Enriched from the store in `plugin_release_detail`; the pure
+    /// manifest [`From`] conversion leaves it `false`.
+    pub connected: bool,
+    /// A client id resolves for this profile (manifest baked-in, a stored
+    /// per-install override, or a settings value) — Connect is gated on this.
+    /// The pure [`From`] sets it from the manifest's baked `client-id` only;
+    /// `plugin_release_detail` ORs in a stored override.
+    pub client_id_configured: bool,
 }
 
 /// Task 12 cross-layer addition: the currently ACTIVE version's bundle
@@ -1302,6 +1318,10 @@ impl From<ryuzi_plugin_sdk::PluginBundleManifest> for ComponentManifestInfo {
                 .map(|p| ComponentOauthProfileInfo {
                     id: p.id,
                     scopes: p.scopes,
+                    token_url: p.token_url,
+                    device_authorization_url: p.device_authorization_url,
+                    connected: false,
+                    client_id_configured: p.client_id.is_some(),
                 })
                 .collect(),
         }

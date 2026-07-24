@@ -28,6 +28,7 @@ import {
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
+import { OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { useNav } from "@/store-nav";
 import { usePlugins } from "@/store-plugins";
@@ -1071,6 +1072,18 @@ export function PluginDetailView({ id }: { id: string }) {
             onInstall={() => void onInstallComponent()}
             activateBusyVersion={activateBusyVersion}
             onActivateVersion={(v) => void onActivateComponentVersion(v)}
+          />
+        )}
+
+        {/* Device-grant OAuth connect for a component's declared profiles —
+            renders itself null unless the active manifest declares a
+            device-flow-connectable profile. Refreshes the release detail on
+            connect/disconnect so the status badge reflects the new token. */}
+        {releaseDetail?.activeManifest && (
+          <OauthProfileConnections
+            pluginId={id}
+            profiles={releaseDetail.activeManifest.oauthProfiles}
+            onChanged={() => void loadRelease()}
           />
         )}
       </div>

@@ -99,7 +99,20 @@ pub struct OAuthProfile {
     pub id: String,
     pub authorize_url: Option<String>,
     pub token_url: Option<String>,
+    /// The RFC 8628 device-authorization endpoint (e.g. GitHub's
+    /// `https://github.com/login/device/code`). `OAuthProfile` has no other
+    /// place to record it, and the host's `begin_device_flow` needs it
+    /// explicitly; a component that supports the device grant declares it here.
+    /// `None` for a profile that does not offer device flow.
+    pub device_authorization_url: Option<String>,
     pub scopes: Vec<String>,
+    /// A first-party PUBLIC OAuth client id baked into the (signed) manifest —
+    /// the `gh` CLI model: the component ships its own app's client id so an
+    /// end-user connects with zero configuration. Public, not a secret (device
+    /// flow uses a public client, no client secret). A user-set
+    /// [`Self::client_id_setting`] or a stored per-install client id still wins
+    /// over this default (see the host's `resolve_client_id`).
+    pub client_id: Option<String>,
     pub client_id_setting: Option<String>,
     pub client_secret_setting: Option<String>,
     pub resource: Option<String>,
@@ -489,6 +502,56 @@ component = "acme.wasm"
         let err = PluginBundleManifest::from_toml(toml_str)
             .expect_err("invalid wit-api version req should fail validation");
         assert!(matches!(err, BundleError::InvalidWitApi(v, _) if v == "not-a-range"));
+    }
+
+    #[test]
+    fn parses_device_flow_profile_fields() {
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+component = "acme.wasm"
+
+[[oauth]]
+id = "github"
+authorize-url = "https://github.com/login/oauth/authorize"
+token-url = "https://github.com/login/oauth/access_token"
+device-authorization-url = "https://github.com/login/device/code"
+client-id = "Iv1.public-app-id"
+scopes = ["repo"]
+"#;
+        let manifest =
+            PluginBundleManifest::from_toml(toml_str).expect("device-flow profile should parse");
+        let profile = &manifest.oauth[0];
+        assert_eq!(
+            profile.device_authorization_url.as_deref(),
+            Some("https://github.com/login/device/code")
+        );
+        assert_eq!(profile.client_id.as_deref(), Some("Iv1.public-app-id"));
+    }
+
+    #[test]
+    fn device_flow_fields_default_to_none_when_absent() {
+        // A pre-existing profile that declares neither field still parses, with
+        // both new fields defaulting to `None`.
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+component = "acme.wasm"
+
+[[oauth]]
+id = "legacy"
+authorize-url = "https://example.com/authorize"
+"#;
+        let manifest = PluginBundleManifest::from_toml(toml_str).expect("legacy profile parses");
+        let profile = &manifest.oauth[0];
+        assert!(profile.device_authorization_url.is_none());
+        assert!(profile.client_id.is_none());
     }
 
     #[test]

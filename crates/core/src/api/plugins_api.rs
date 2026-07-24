@@ -1690,6 +1690,13 @@ async fn plugin_release_detail(
     } else {
         None
     };
+    let active_manifest = match active_manifest {
+        Some(mut manifest) => {
+            enrich_oauth_profile_status(cp.store(), plugin_id, &mut manifest).await;
+            Some(manifest)
+        }
+        None => None,
+    };
     Ok(ComponentReleaseDetail {
         plugin_id: plugin_id.to_string(),
         releases: releases
@@ -1699,6 +1706,36 @@ async fn plugin_release_detail(
         active_version,
         active_manifest,
     })
+}
+
+/// Enrich each OAuth profile with live connection status from the store: whether
+/// a usable token is stored (`connected`) and whether a client id resolves
+/// (`client_id_configured` — manifest baked-in OR a stored per-install
+/// override). The pure manifest `From` cannot see the store, so it leaves
+/// `connected=false` and `client_id_configured` = the manifest's baked-in value
+/// only; this ORs in the stored-override and token facts.
+async fn enrich_oauth_profile_status(
+    store: &Store,
+    plugin_id: &str,
+    manifest: &mut ComponentManifestInfo,
+) {
+    for profile in &mut manifest.oauth_profiles {
+        profile.connected = store
+            .get_plugin_oauth_profile_token(plugin_id, &profile.id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|tok| !tok.reconnect_required);
+        if !profile.client_id_configured {
+            profile.client_id_configured = store
+                .get_plugin_oauth_profile_client(plugin_id, &profile.id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|c| c.client_id)
+                .is_some_and(|id| !id.is_empty());
+        }
+    }
 }
 
 /// Install (or update to) a component plugin's signed release via the Task 11a
@@ -3623,6 +3660,158 @@ mod tests {
         assert!(detail.releases.is_empty());
         assert!(detail.active_version.is_none());
         assert!(detail.active_manifest.is_none());
+    }
+
+    // The pure manifest -> `ComponentManifestInfo` conversion must carry the
+    // device-flow profile fields (token_url, device_authorization_url) and mark
+    // `client_id_configured` from a baked manifest client-id, leaving
+    // `connected` false (it cannot see the store).
+    #[test]
+    fn component_manifest_from_carries_profile_urls_and_baked_client_id() {
+        let manifest = ryuzi_plugin_sdk::PluginBundleManifest::from_toml(
+            r#"
+id = "github"
+name = "GitHub"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "per-call"
+component = "github.wasm"
+
+[[oauth]]
+id = "github"
+token-url = "https://github.com/login/oauth/access_token"
+device-authorization-url = "https://github.com/login/device/code"
+client-id = "Iv1.public"
+"#,
+        )
+        .unwrap();
+        let info = ComponentManifestInfo::from(manifest);
+        let p = &info.oauth_profiles[0];
+        assert_eq!(
+            p.token_url.as_deref(),
+            Some("https://github.com/login/oauth/access_token")
+        );
+        assert_eq!(
+            p.device_authorization_url.as_deref(),
+            Some("https://github.com/login/device/code")
+        );
+        assert!(
+            p.client_id_configured,
+            "baked manifest client-id => configured"
+        );
+        assert!(!p.connected, "pure From cannot see the store");
+    }
+
+    // Store enrichment: a usable stored token flips `connected`; a stored client
+    // id flips `client_id_configured` for a profile the manifest did not bake
+    // one into; a `reconnect_required` token is NOT connected; per-profile rows
+    // never bleed across ids.
+    #[tokio::test]
+    async fn enrich_oauth_profile_status_reflects_stored_token_and_client() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "github",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "github".into(),
+                profile_id: "custom".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("stored-id".into()),
+            })
+            .await
+            .unwrap();
+
+        let profile = |id: &str, baked: bool| ComponentOauthProfileInfo {
+            id: id.to_string(),
+            scopes: vec![],
+            token_url: None,
+            device_authorization_url: None,
+            connected: false,
+            client_id_configured: baked,
+        };
+        let mut manifest = ComponentManifestInfo {
+            publisher: "Ryuzi".into(),
+            description: String::new(),
+            lifecycle: "per-call".into(),
+            domains: vec![],
+            oauth_profiles: vec![
+                profile("github", true),
+                profile("custom", false),
+                profile("unset", false),
+            ],
+        };
+
+        enrich_oauth_profile_status(store, "github", &mut manifest).await;
+
+        let github = &manifest.oauth_profiles[0];
+        assert!(github.connected, "seeded token => connected");
+        assert!(github.client_id_configured);
+        let custom = &manifest.oauth_profiles[1];
+        assert!(!custom.connected, "no token for this profile");
+        assert!(custom.client_id_configured, "stored client => configured");
+        let unset = &manifest.oauth_profiles[2];
+        assert!(!unset.connected);
+        assert!(
+            !unset.client_id_configured,
+            "no manifest baked-in and no stored client => not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_marks_a_reconnect_required_token_as_not_connected() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "github",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: true,
+                },
+            )
+            .await
+            .unwrap();
+        let mut manifest = ComponentManifestInfo {
+            publisher: "Ryuzi".into(),
+            description: String::new(),
+            lifecycle: "per-call".into(),
+            domains: vec![],
+            oauth_profiles: vec![ComponentOauthProfileInfo {
+                id: "github".into(),
+                scopes: vec![],
+                token_url: None,
+                device_authorization_url: None,
+                connected: false,
+                client_id_configured: true,
+            }],
+        };
+        enrich_oauth_profile_status(store, "github", &mut manifest).await;
+        assert!(
+            !manifest.oauth_profiles[0].connected,
+            "a reconnect_required token must not read as connected"
+        );
     }
 
     #[tokio::test]

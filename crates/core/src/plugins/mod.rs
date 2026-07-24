@@ -465,6 +465,20 @@ pub async fn toggle_enabled(
     if plugin.harness.is_some() {
         anyhow::bail!("{id} is always enabled");
     }
+    // A component bundle is registered manifest-only, but its off-disk
+    // connector/gateway/provider all gate on `plugin.<id>.enabled`
+    // (`component_plugin_enabled`). Flip that same key — otherwise the
+    // manifest-only branch below would refuse ("always available") and the
+    // component could never be turned on through the UI. Mirrors
+    // `PluginHost::is_enabled`'s component branch.
+    if plugin.source == PluginSource::Component {
+        return settings
+            .set(
+                &format!("plugin.{id}.enabled"),
+                if enable { "true" } else { "false" },
+            )
+            .await;
+    }
     if plugin.gateway.is_some() {
         return toggle_csv(settings, "enabled_gateways", id, enable).await;
     }
@@ -838,6 +852,20 @@ mod toggle_enabled_tests {
         }
     }
 
+    /// A first-party component bundle row: manifest-only (its capability runs
+    /// off-disk) with `PluginSource::Component`.
+    fn component_only(id: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: manifest(id),
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: None,
+            provider: None,
+            source: PluginSource::Component,
+        }
+    }
+
     async fn open_settings() -> (SettingsStore, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -1094,6 +1122,47 @@ mod toggle_enabled_tests {
         );
         assert!(!host
             .is_enabled(&settings, "acme-toggle-test")
+            .await
+            .unwrap());
+    }
+
+    // A component bundle is manifest-only, but it must NOT read as always-on:
+    // its off-disk tools gate on `plugin.<id>.enabled` (`component_plugin_enabled`),
+    // so `is_enabled` must mirror that gate (default off) and `toggle_enabled`
+    // must be able to flip it — the whole point of making the plugin usable.
+    #[tokio::test]
+    async fn component_is_disabled_by_default_and_toggle_flips_its_gate() {
+        let (settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        host.add(component_only("github"));
+
+        // Default: a component is OFF (unlike a manifest-only builtin, which is
+        // always on) — so its WASM tools don't load until explicitly enabled.
+        assert!(!host.is_enabled(&settings, "github").await.unwrap());
+
+        // Enable flips the exact key `component_plugin_enabled` reads.
+        toggle_enabled(&host, &settings, "github", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings
+                .get("plugin.github.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        assert!(host.is_enabled(&settings, "github").await.unwrap());
+        assert!(host::component_plugin_enabled(&settings, "github")
+            .await
+            .unwrap());
+
+        // Disable flips it back.
+        toggle_enabled(&host, &settings, "github", false)
+            .await
+            .unwrap();
+        assert!(!host.is_enabled(&settings, "github").await.unwrap());
+        assert!(!host::component_plugin_enabled(&settings, "github")
             .await
             .unwrap());
     }
