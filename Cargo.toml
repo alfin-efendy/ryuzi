@@ -48,7 +48,7 @@ tracing = "0.1"
 # default features: the default set pulls `ansi`, which would write terminal
 # colour escapes into daemon.log.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
-wasmtime = { version = "46.0.1", features = ["component-model"] }
+wasmtime = { version = "48.0.7", features = ["component-model"] }
 wasmtime-wasi = "46.0.1"
 
 [workspace.lints.rust]
