@@ -65,7 +65,7 @@ jobs:
           bun scripts/catalog/build-feed.ts
       - name: Verify the feed against the compiled-in pubkey
         run: cargo run --locked -p ryuzi-core --bin verify-plugin-artifacts -- catalog catalog.json catalog.json.sig
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: plugins-dry-run
